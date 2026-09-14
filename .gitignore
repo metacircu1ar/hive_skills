@@ -1,0 +1,26 @@
+.DS_Store
+Thumbs.db
+
+# Python validation artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Editor and local environment files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Agent and local workspace state
+.claude/
+.codex/
+.hive_skills_*
+
+# Local scratch output
+tmp/
+.tmp/

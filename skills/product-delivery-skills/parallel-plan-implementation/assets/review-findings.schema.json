@@ -1,0 +1,340 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/parallel-plan-implementation/review-findings.schema.json",
+  "title": "Phase Commit Reviewer Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "reviewer_profile",
+    "phase_id",
+    "component_id",
+    "target_commit",
+    "target_parent",
+    "review_baseline_commit",
+    "reviewed_at",
+    "commands_run",
+    "limitations",
+    "findings"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "status": {
+      "enum": [
+        "COMPLETED",
+        "COMPLETED_WITH_LIMITATIONS",
+        "MODEL_BLOCKER",
+        "SCOPE_BLOCKER",
+        "FAILED"
+      ]
+    },
+    "reviewer_profile": {
+      "$ref": "#/$defs/reviewerProfile"
+    },
+    "phase_id": {
+      "$ref": "#/$defs/phaseId"
+    },
+    "component_id": {
+      "$ref": "#/$defs/componentId"
+    },
+    "target_commit": {
+      "$ref": "#/$defs/commit"
+    },
+    "target_parent": {
+      "$ref": "#/$defs/commit"
+    },
+    "review_baseline_commit": {
+      "$ref": "#/$defs/commit"
+    },
+    "reviewed_at": {
+      "type": "string",
+      "format": "date-time",
+      "minLength": 1
+    },
+    "commands_run": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/commandResult"
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 15,
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    }
+  },
+  "$defs": {
+    "phaseId": {
+      "type": "string",
+      "pattern": "^PH-[0-9]{3,}-[0-9]{2,}$"
+    },
+    "componentId": {
+      "type": "string",
+      "pattern": "^CMP-[0-9]{3,}$"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{7,64}$",
+      "minLength": 7
+    },
+    "reviewerProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested_model",
+        "requested_reasoning_effort",
+        "actual_model",
+        "actual_reasoning_effort",
+        "selection_status",
+        "substitution_approved"
+      ],
+      "properties": {
+        "requested_model": {
+          "const": "gpt-5.6-sol"
+        },
+        "requested_reasoning_effort": {
+          "const": "xhigh"
+        },
+        "actual_model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "actual_reasoning_effort": {
+          "type": "string",
+          "minLength": 1
+        },
+        "selection_status": {
+          "enum": [
+            "confirmed",
+            "host-unverifiable",
+            "unavailable",
+            "substituted"
+          ]
+        },
+        "substitution_approved": {
+          "type": "boolean"
+        }
+      }
+    },
+    "commandResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command",
+        "status",
+        "summary"
+      ],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "passed",
+            "failed",
+            "not-run"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file",
+        "line"
+      ],
+      "properties": {
+        "file": {
+          "type": "string",
+          "minLength": 1
+        },
+        "line": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "path",
+        "detail"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "plan",
+            "boundary",
+            "contract",
+            "architecture",
+            "repository-rule",
+            "test",
+            "code",
+            "other"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "verdict",
+        "severity",
+        "category",
+        "target_location",
+        "final_location",
+        "summary",
+        "failure_scenario",
+        "evidence",
+        "references",
+        "introduced_by_target_commit",
+        "present_at_review_baseline",
+        "later_commit_status",
+        "recommended_owner_phase",
+        "recommended_fix",
+        "recommended_test",
+        "confidence_notes"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^RVW-PH-[0-9]{3,}-[0-9]{2,}-[0-9]{3,}$"
+        },
+        "verdict": {
+          "enum": [
+            "CONFIRMED",
+            "PLAUSIBLE"
+          ]
+        },
+        "severity": {
+          "enum": [
+            "critical",
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "category": {
+          "enum": [
+            "correctness",
+            "security",
+            "authorization",
+            "tenant-isolation",
+            "data-integrity",
+            "migration",
+            "contract",
+            "compatibility",
+            "concurrency",
+            "reliability",
+            "performance",
+            "resource-lifecycle",
+            "observability",
+            "test-gap",
+            "plan-compliance",
+            "boundary-compliance",
+            "reuse",
+            "simplification",
+            "conventions",
+            "other"
+          ]
+        },
+        "target_location": {
+          "$ref": "#/$defs/location"
+        },
+        "final_location": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/location"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "failure_scenario": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reference"
+          }
+        },
+        "introduced_by_target_commit": {
+          "type": "boolean"
+        },
+        "present_at_review_baseline": {
+          "type": "boolean"
+        },
+        "later_commit_status": {
+          "enum": [
+            "not-fixed",
+            "fixed",
+            "superseded",
+            "unknown"
+          ]
+        },
+        "recommended_owner_phase": {
+          "$ref": "#/$defs/phaseId"
+        },
+        "recommended_fix": {
+          "type": "string",
+          "minLength": 1
+        },
+        "recommended_test": {
+          "type": "string",
+          "minLength": 1
+        },
+        "confidence_notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

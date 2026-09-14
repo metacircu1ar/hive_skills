@@ -1,0 +1,765 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/parallel-plan-implementation/execution-manifest.schema.json",
+  "title": "Parallel Plan Implementation Execution Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "repository_root",
+    "planning_root",
+    "parallel_root",
+    "approved_scope",
+    "integration",
+    "agent_profiles",
+    "capabilities",
+    "shared_path_owners",
+    "contracts",
+    "units",
+    "waves",
+    "integration_order",
+    "excluded_units",
+    "validation_commands",
+    "review_gate",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "status": {
+      "enum": [
+        "draft",
+        "boundaries-ready",
+        "contract-baseline-frozen",
+        "executing",
+        "blocked",
+        "completed"
+      ]
+    },
+    "repository_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "planning_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "parallel_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "approved_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase_ids",
+        "description",
+        "delivery_scope_mode",
+        "requested_outcome",
+        "impact_cone",
+        "preserved_behavior",
+        "non_goals"
+      ],
+      "properties": {
+        "phase_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/phaseId"
+          },
+          "uniqueItems": true
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "delivery_scope_mode": {
+          "enum": [
+            "full product",
+            "scoped change",
+            "modernization or migration",
+            "remediation or reliability"
+          ]
+        },
+        "requested_outcome": {
+          "type": "string",
+          "minLength": 1
+        },
+        "impact_cone": {
+          "type": "string",
+          "minLength": 1
+        },
+        "preserved_behavior": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "non_goals": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "minItems": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "delivery_scope_mode": {
+                "enum": [
+                  "scoped change",
+                  "modernization or migration",
+                  "remediation or reliability"
+                ]
+              }
+            },
+            "required": [
+              "delivery_scope_mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "preserved_behavior": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "integration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "branch",
+        "worktree",
+        "baseline_commit",
+        "planning_commit",
+        "contract_baseline_commit",
+        "current_checkpoint"
+      ],
+      "properties": {
+        "branch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "worktree": {
+          "type": "string",
+          "minLength": 1
+        },
+        "baseline_commit": {
+          "$ref": "#/$defs/commit"
+        },
+        "planning_commit": {
+          "$ref": "#/$defs/commit"
+        },
+        "contract_baseline_commit": {
+          "$ref": "#/$defs/commitOrPending"
+        },
+        "current_checkpoint": {
+          "$ref": "#/$defs/commit"
+        }
+      }
+    },
+    "agent_profiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "main",
+        "implementor",
+        "reviewer"
+      ],
+      "properties": {
+        "main": {
+          "$ref": "#/$defs/agentProfile"
+        },
+        "implementor": {
+          "$ref": "#/$defs/agentProfile"
+        },
+        "reviewer": {
+          "$ref": "#/$defs/agentProfile"
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "git",
+        "worktrees",
+        "subagents",
+        "true_parallel_execution"
+      ],
+      "properties": {
+        "git": {
+          "type": "boolean"
+        },
+        "worktrees": {
+          "type": "boolean"
+        },
+        "subagents": {
+          "type": "boolean"
+        },
+        "true_parallel_execution": {
+          "type": "boolean"
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "contracts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/contract"
+      }
+    },
+    "units": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/unit"
+      },
+      "minItems": 1
+    },
+    "waves": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/wave"
+      },
+      "minItems": 1
+    },
+    "integration_order": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/phaseId"
+      },
+      "uniqueItems": true,
+      "minItems": 1
+    },
+    "excluded_units": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "phase_id",
+          "reason"
+        ],
+        "properties": {
+          "phase_id": {
+            "$ref": "#/$defs/phaseId"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "validation_commands": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1
+    },
+    "review_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "authorization_record",
+        "review_root"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "not-offered",
+            "offered",
+            "declined",
+            "approved",
+            "running",
+            "completed",
+            "blocked"
+          ]
+        },
+        "authorization_record": {
+          "type": "string"
+        },
+        "review_root": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "updated_at": {
+      "type": "string",
+      "minLength": 1,
+      "format": "date-time"
+    },
+    "shared_path_owners": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/sharedPathOwner"
+      }
+    }
+  },
+  "$defs": {
+    "phaseId": {
+      "type": "string",
+      "pattern": "^PH-[0-9]{3,}-[0-9]{2,}$"
+    },
+    "componentId": {
+      "type": "string",
+      "pattern": "^CMP-[0-9]{3,}$"
+    },
+    "contractId": {
+      "type": "string",
+      "pattern": "^CTR-[0-9]{3,}$"
+    },
+    "commit": {
+      "type": "string",
+      "minLength": 7,
+      "pattern": "^[0-9a-fA-F]{7,64}$"
+    },
+    "commitOrPending": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/commit"
+        },
+        {
+          "const": "pending"
+        }
+      ]
+    },
+    "agentProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested_model",
+        "requested_reasoning_effort",
+        "actual_model",
+        "actual_reasoning_effort",
+        "selection_status",
+        "substitution_approved",
+        "notes"
+      ],
+      "properties": {
+        "requested_model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requested_reasoning_effort": {
+          "type": "string",
+          "minLength": 1
+        },
+        "actual_model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "actual_reasoning_effort": {
+          "type": "string",
+          "minLength": 1
+        },
+        "selection_status": {
+          "enum": [
+            "confirmed",
+            "host-unverifiable",
+            "unavailable",
+            "substituted"
+          ]
+        },
+        "substitution_approved": {
+          "type": "boolean"
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "pathArray": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase_id",
+        "type",
+        "reason",
+        "contract_ids"
+      ],
+      "properties": {
+        "phase_id": {
+          "$ref": "#/$defs/phaseId"
+        },
+        "type": {
+          "enum": [
+            "contract-bound",
+            "implementation-bound"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "contract_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/contractId"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "kind",
+        "owner_phase",
+        "consumer_phases",
+        "canonical_path",
+        "version",
+        "status",
+        "validation_commands"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/contractId"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner_phase": {
+          "$ref": "#/$defs/phaseId"
+        },
+        "consumer_phases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/phaseId"
+          },
+          "uniqueItems": true
+        },
+        "canonical_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "frozen",
+            "implemented",
+            "deprecated",
+            "retired"
+          ]
+        },
+        "validation_commands": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        }
+      }
+    },
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "component_id",
+        "title",
+        "plan_path",
+        "boundary_path",
+        "worker_prompt_path",
+        "wave",
+        "integration_index",
+        "base_commit",
+        "branch",
+        "worktree",
+        "classification",
+        "decision_gates",
+        "dependencies",
+        "consumes_contracts",
+        "produces_contracts",
+        "owned_paths",
+        "read_only_paths",
+        "shared_paths",
+        "generated_paths",
+        "forbidden_paths",
+        "validation_commands",
+        "status",
+        "worker_commits",
+        "integration_commit",
+        "limitations",
+        "blockers"
+      ],
+      "anyOf": [
+        {
+          "properties": {
+            "owned_paths": {
+              "minItems": 1
+            }
+          }
+        },
+        {
+          "properties": {
+            "shared_paths": {
+              "minItems": 1
+            }
+          }
+        },
+        {
+          "properties": {
+            "generated_paths": {
+              "minItems": 1
+            }
+          }
+        }
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/phaseId"
+        },
+        "component_id": {
+          "$ref": "#/$defs/componentId"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "plan_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "boundary_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "worker_prompt_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "wave": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "integration_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "base_commit": {
+          "$ref": "#/$defs/commitOrPending"
+        },
+        "branch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "worktree": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/dependency"
+          }
+        },
+        "consumes_contracts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/contractId"
+          },
+          "uniqueItems": true
+        },
+        "produces_contracts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/contractId"
+          },
+          "uniqueItems": true
+        },
+        "owned_paths": {
+          "$ref": "#/$defs/pathArray"
+        },
+        "read_only_paths": {
+          "$ref": "#/$defs/pathArray"
+        },
+        "shared_paths": {
+          "$ref": "#/$defs/pathArray"
+        },
+        "generated_paths": {
+          "$ref": "#/$defs/pathArray"
+        },
+        "forbidden_paths": {
+          "$ref": "#/$defs/pathArray"
+        },
+        "validation_commands": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "status": {
+          "enum": [
+            "planned",
+            "blocked",
+            "ready",
+            "running",
+            "worker-completed",
+            "integration-failed",
+            "integrated",
+            "verified",
+            "rejected"
+          ]
+        },
+        "worker_status": {
+          "enum": [
+            "COMPLETED",
+            "COMPLETED_WITH_LIMITATIONS",
+            "CONTRACT_BLOCKER",
+            "IMPLEMENTATION_BLOCKER",
+            "FAILED"
+          ]
+        },
+        "worker_commits": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/commit"
+          }
+        },
+        "integration_commit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/commit"
+            },
+            {
+              "const": "pending"
+            }
+          ]
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "blockers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "classification": {
+          "enum": [
+            "independent",
+            "contract-bound",
+            "implementation-bound",
+            "decision-gated"
+          ]
+        },
+        "decision_gates": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^DEC-[0-9]{3,}$"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "wave": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "number",
+        "base_commit",
+        "phase_ids",
+        "status"
+      ],
+      "properties": {
+        "number": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "base_commit": {
+          "$ref": "#/$defs/commitOrPending"
+        },
+        "phase_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/phaseId"
+          },
+          "uniqueItems": true
+        },
+        "status": {
+          "enum": [
+            "planned",
+            "ready",
+            "running",
+            "integrating",
+            "completed",
+            "blocked"
+          ]
+        }
+      }
+    },
+    "sharedPathOwner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "owner",
+        "strategy"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner": {
+          "type": "string",
+          "pattern": "^(?:PH-[0-9]{3,}-[0-9]{2,}|MAIN)$"
+        },
+        "strategy": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}
