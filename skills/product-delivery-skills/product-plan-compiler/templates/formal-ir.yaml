@@ -1,0 +1,181 @@
+# Formal intermediate representation for a product/system plan.
+# Every formal item must cite source requirement IDs or be marked as derived,
+# assumption, or verification-only. Empty sample items are placeholders.
+
+metadata:
+  project: ""
+  plan_root: "docs/implementation-plan"
+  verification_root: "docs/implementation-plan/formal-verification"
+  plan_version: ""
+  source_baseline: ""
+  ir_version: ""
+  created_at: ""
+  source_files: []
+  status: "draft" # draft | in_refinement | agreement_bounded | agreement_proved | agreement_mixed | blocked
+
+scope:
+  included: []
+  excluded: []
+  abstraction_notes: []
+
+provenance_kinds:
+  - source_requirement
+  - derived
+  - assumption
+  - verification_only
+
+glossary:
+  - term: ""
+    definition: ""
+    aliases: []
+    source_requirements: []
+
+entities:
+  - id: ENT-001
+    name: ""
+    description: ""
+    provenance: source_requirement
+    identity:
+      kind: "natural" # natural | generated | composite | value_object
+      fields: []
+    attributes:
+      - name: ""
+        type: ""
+        required: true
+        constraints: []
+    lifecycle: null
+    retention: ""
+    source_requirements: []
+
+relations:
+  - id: REL-001
+    name: ""
+    from: ENT-001
+    to: ENT-002
+    from_cardinality: "0..*"
+    to_cardinality: "1"
+    ownership: "none" # none | aggregate | composition | reference
+    mutable: true
+    deletion_behavior: "restrict" # restrict | cascade | detach | archive | custom
+    constraints: []
+    provenance: source_requirement
+    source_requirements: []
+
+state_machines:
+  - id: SM-001
+    entity: ENT-001
+    states: []
+    initial_states: []
+    terminal_states: []
+    transitions:
+      - id: TR-001
+        operation: OP-001
+        from: []
+        to: ""
+        guard: ""
+        provenance: source_requirement
+        source_requirements: []
+
+operations:
+  - id: OP-001
+    name: ""
+    target_entities: []
+    trigger: ""
+    actors: []
+    inputs: []
+    preconditions: []
+    effects: []
+    failure_effects: []
+    atomicity: ""
+    idempotency: ""
+    retry_semantics: ""
+    concurrency_notes: ""
+    provenance: source_requirement
+    source_requirements: []
+
+invariants:
+  - id: INV-001
+    statement: ""
+    severity: "critical" # critical | high | medium | low
+    provenance: source_requirement
+    source_requirements: []
+    backend_candidates: []
+
+reachability_requirements:
+  - id: REACH-001
+    statement: ""
+    expected: "reachable" # reachable | unreachable
+    provenance: source_requirement
+    source_requirements: []
+
+safety_properties:
+  - id: SAFE-001
+    statement: ""
+    provenance: source_requirement
+    source_requirements: []
+
+liveness_properties:
+  - id: LIVE-001
+    statement: ""
+    fairness_assumptions: []
+    environment_assumptions: []
+    provenance: source_requirement
+    source_requirements: []
+
+authorization:
+  principals: []
+  roles: []
+  capabilities: []
+  rules:
+    - id: AUTH-001
+      effect: "allow" # allow | deny
+      condition: ""
+      precedence: ""
+      revocation_semantics: ""
+      provenance: source_requirement
+      source_requirements: []
+
+quantitative_constraints:
+  - id: QNT-001
+    expression: ""
+    units: ""
+    provenance: source_requirement
+    source_requirements: []
+
+assumptions:
+  - id: ASM-001
+    statement: ""
+    category: "environment" # environment | trust | timing | delivery | uniqueness | abstraction | fairness
+    source: "explicit_plan" # explicit_plan | inferred | verification_only
+    source_requirements: []
+
+verification_obligations:
+  - id: OBL-001
+    kind: "satisfiable" # satisfiable | invariant | reachability | safety | liveness | theorem | mutation
+    statement: ""
+    selected_backend: "alloy" # alloy | smt | tla_tlc | tla_apalache | tlaps | lean | rocq
+    model_symbol: ""
+    bounds: []
+    assumptions: []
+    source_requirements: []
+    expected_result: ""
+    status: "not_run" # not_run | passed | failed | blocked | accepted_exception
+    evidence_run: ""
+
+open_questions:
+  - id: Q-001
+    question: ""
+    affected_items: []
+    blocking: false
+    decision_owner: ""
+    latest_responsible_point: ""
+
+traceability:
+  requirements:
+    - requirement_id: REQ-001
+      source_location: ""
+      ir_items: []
+      model_symbols: []
+      verification_obligations: []
+      evidence_runs: []
+      status: "mapped" # mapped | excluded | non_formalizable | unresolved
