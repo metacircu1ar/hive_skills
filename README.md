@@ -10,7 +10,7 @@ A personal collection of agent skills, workflow references, multi-agent coordina
 
 ### Top-level workflow skills and references
 
-The standalone Markdown files directly under [`skills/`](skills/) capture reusable agent workflows and extracted runtime behavior:
+These entries under [`skills/`](skills/) capture reusable agent workflows and review passes. Standalone references are Markdown files; installable skills use a directory containing `SKILL.md`.
 
 | Skill or reference | Purpose |
 | --- | --- |
@@ -18,13 +18,14 @@ The standalone Markdown files directly under [`skills/`](skills/) capture reusab
 | [`batch`](skills/batch-skill.md) | Plan and execute wide, independently mergeable changes through parallel worktree agents and separate pull requests. |
 | [`code-review`](skills/code-review-skill.md) | Review a diff, verify findings, and fix in place by default, or propose changes in read-only mode; optional finder/verifier worker counts and pull-request comments. |
 | [`deep-research`](skills/deep-research-skill.md) | Produce a cited report through parallel searches, source extraction, and adversarial claim verification. |
+| [`error-logging-review`](skills/error-logging-review/SKILL.md) | Trace error checking, handling, and logging; check useful non-error events, diagnostic context, sensitive data exposure, and log noise. Supports finder/verifier counts and both delivery modes. |
 | [`goal`](skills/goal-skill.md) | Keep an agent working until an evidence-backed completion condition is judged to be satisfied. |
 | [`init-verifiers`](skills/init-verifiers-skill.md) | Generate project-specific functional verifier skills for browser, CLI, and HTTP behavior. |
 | [`professional-localization`](skills/professional-localization-skill.md) | Design localization as an end-to-end product boundary spanning UI, server, storage, contracts, and CI. |
 | [`simplify`](skills/simplify-skill.md) | Improve reuse, simplicity, efficiency, and abstraction in place by default, or propose changes in read-only mode; optional review-worker count. |
 | [`testable-frontend`](skills/testable-frontend-skill.md) | Structure frontend code and test tiers so deterministic automated testing is practical by construction. |
 
-Both `code-review` and `simplify` default to zero workers and
+`code-review`, `simplify`, and `error-logging-review` default to zero workers and
 `--delivery-mode in-place`. Use `--delivery-mode read-only` to receive proposed
 modifications in prose or code snippets without changing repository files.
 
@@ -107,6 +108,7 @@ Clone the repository and copy the skill or reference you need into the directory
 
 ```text
 skills/<standalone-workflow>-skill.md
+skills/error-logging-review/
 skills/code-review-loop/
 skills/parallel-code-review-loop/
 skills/hive-review-loop/
@@ -120,6 +122,7 @@ skills/audit/<skill-name>/
 
 ```text
 skills/*-skill.md               Standalone workflow skills and references
+skills/error-logging-review/     Focused error-handling and logging review pass
 skills/code-review-loop/         Two-agent implementation/review coordination skill
 skills/code-review-loop/verification/  TLA+ model, checks, and reproducibility notes
 skills/parallel-code-review-loop/  Multi-repository orchestration over isolated review pairs
