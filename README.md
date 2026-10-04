@@ -23,11 +23,12 @@ These entries under [`skills/`](skills/) capture reusable agent workflows and re
 | [`init-verifiers`](skills/init-verifiers-skill.md) | Generate project-specific functional verifier skills for browser, CLI, and HTTP behavior. |
 | [`professional-localization`](skills/professional-localization-skill.md) | Design localization as an end-to-end product boundary spanning UI, server, storage, contracts, and CI. |
 | [`simplify`](skills/simplify-skill.md) | Improve reuse, simplicity, efficiency, and abstraction in place by default, or propose changes in read-only mode; optional review-worker count. |
+| [`test-quality-review`](skills/test-quality-review/SKILL.md) | Review assertion strength, risk coverage, test doubles, reliability, isolation, and CI execution across languages and frameworks. Supports finder/verifier counts and both delivery modes. |
 | [`testable-frontend`](skills/testable-frontend-skill.md) | Structure frontend code and test tiers so deterministic automated testing is practical by construction. |
 
-`code-review`, `simplify`, and `error-logging-review` default to zero workers and
-`--delivery-mode in-place`. Use `--delivery-mode read-only` to receive proposed
-modifications in prose or code snippets without changing repository files.
+`code-review`, `simplify`, `error-logging-review`, and `test-quality-review` default to
+zero workers and `--delivery-mode in-place`. Use `--delivery-mode read-only` to receive
+proposed modifications in prose or code snippets without changing repository files.
 
 ### Agent coordination skills
 
@@ -109,6 +110,7 @@ Clone the repository and copy the skill or reference you need into the directory
 ```text
 skills/<standalone-workflow>-skill.md
 skills/error-logging-review/
+skills/test-quality-review/
 skills/code-review-loop/
 skills/parallel-code-review-loop/
 skills/hive-review-loop/
@@ -123,6 +125,7 @@ skills/audit/<skill-name>/
 ```text
 skills/*-skill.md               Standalone workflow skills and references
 skills/error-logging-review/     Focused error-handling and logging review pass
+skills/test-quality-review/      Language- and framework-independent test-quality pass
 skills/code-review-loop/         Two-agent implementation/review coordination skill
 skills/code-review-loop/verification/  TLA+ model, checks, and reproducibility notes
 skills/parallel-code-review-loop/  Multi-repository orchestration over isolated review pairs
