@@ -21,14 +21,16 @@ These entries under [`skills/`](skills/) capture reusable agent workflows and re
 | [`error-logging-review`](skills/error-logging-review/SKILL.md) | Trace error checking, handling, and logging; check useful non-error events, diagnostic context, sensitive data exposure, and log noise. Supports finder/verifier counts and both delivery modes. |
 | [`goal`](skills/goal-skill.md) | Keep an agent working until an evidence-backed completion condition is judged to be satisfied. |
 | [`init-verifiers`](skills/init-verifiers-skill.md) | Generate project-specific functional verifier skills for browser, CLI, and HTTP behavior. |
+| [`perf-optimization`](skills/perf-optimization/SKILL.md) | Locate bottlenecks with release-build CPU/wall accounting, bounded instrumentation and profiling, then prove each change with frozen-binary paired experiments under predeclared gates without weakening correctness or durability. Supports finder/verifier counts and both delivery modes. |
 | [`professional-localization`](skills/professional-localization-skill.md) | Design localization as an end-to-end product boundary spanning UI, server, storage, contracts, and CI. |
 | [`simplify`](skills/simplify-skill.md) | Improve reuse, simplicity, efficiency, and abstraction in place by default, or propose changes in read-only mode; optional review-worker count. |
 | [`test-quality-review`](skills/test-quality-review/SKILL.md) | Review assertion strength, risk coverage, test doubles, reliability, isolation, and CI execution across languages and frameworks. Supports finder/verifier counts and both delivery modes. |
 | [`testable-frontend`](skills/testable-frontend-skill.md) | Structure frontend code and test tiers so deterministic automated testing is practical by construction. |
 
-`code-review`, `simplify`, `error-logging-review`, and `test-quality-review` default to
-zero workers and `--delivery-mode in-place`. Use `--delivery-mode read-only` to receive
-proposed modifications in prose or code snippets without changing repository files.
+`code-review`, `simplify`, `error-logging-review`, `test-quality-review`, and
+`perf-optimization` default to zero workers and `--delivery-mode in-place`. Use
+`--delivery-mode read-only` to receive proposed modifications in prose or code
+snippets without changing repository files.
 
 ### Agent coordination skills
 
