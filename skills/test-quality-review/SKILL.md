@@ -134,6 +134,23 @@ Verify that enforcement exists rather than treating assertion syntax as quality.
   Executed lines do not imply checked outcomes; an equivalent mutant is not a defect.
   Propose a missing case only with a plausible failure and an observable assertion.
 
+### CLI and file-write contracts
+
+- When a CLI exists, check entry-point tests for missing, unknown, malformed, out-of-range,
+  or conflicting arguments as applicable, plus valid invocations and help examples.
+  Assert the failure status, diagnostic stream, useful reason/correction, and absence
+  of operational side effects for locally invalid input. Check example validity without
+  freezing incidental help formatting or exposing secrets; parser mocks alone cannot
+  establish the command's exit behavior or side-effect ordering.
+- For files published as complete artifacts, check failure/interruption cases during
+  writing and publication, first creation and replacement, and concurrent readers where
+  relevant. Assertions must inspect actual contents: the old or new complete version,
+  or absence before first publication, never partial data. Verify preservation of the
+  old version before publication, cleanup after recoverable failures, and outcomes after
+  the commit point. Include durability and competing-writer cases when promised; atomic
+  replacement alone does not prove them. Use filesystem-backed tests where needed, not
+  only a mocked rename call. Append/stream/database paths need tests of their own protocol.
+
 ### Test doubles and environment fidelity
 
 - Locate the real code that still executes under each mock, stub, fake, or simulator.
