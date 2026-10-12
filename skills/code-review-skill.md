@@ -126,6 +126,39 @@ Check pitfalls of the actual language and framework: for example, JavaScript fal
 and coercion, Python mutable defaults and late-binding closures, Go nil-map writes,
 SQL injection, timezone or daylight-saving transitions, and float equality.
 
+### CLI argument validation and diagnostics
+
+When the product has a CLI, check required arguments, arity, types, ranges, supported
+values, path constraints, and conflicting or dependent options. Reject unknown options
+unless the command explicitly supports forwarding them. Reject locally invalid input
+before operational side effects such as starting jobs, changing files, or sending requests.
+
+Usage errors should identify the offending argument and reason, explain a correction,
+and include a relevant valid invocation example when helpful, with a help pointer for
+further detail. Check that help includes practical examples, invalid input produces a
+nonzero exit status and diagnostics on stderr, and expected usage mistakes do not leak
+secrets or produce an unexplained traceback. Do not confuse argument validation with
+handling failures that can only be discovered when the operation executes.
+
+### File-write integrity
+
+Inspect each affected file-writing path. Files consumed as complete artifacts, such as
+configuration, manifests, saved state, or reports, must be published atomically: readers
+see a complete previous or new version, never partially overwritten contents. Before
+first publication, absence is valid. Preserve the previous version until publication;
+use a supported same-filesystem temporary-file-and-replace mechanism or equivalent.
+
+Check write, flush/close, and publication failures, temporary-file cleanup, permissions,
+and intended overwrite behavior. Do not assume a generic move or cross-filesystem copy
+is atomic. Separate atomic visibility from crash/power-loss durability, concurrent-writer
+coordination, and multi-file consistency; require the synchronization or transaction
+mechanism appropriate to the promised guarantee. A failure after publication may leave
+the new version visible, so reported outcomes and recovery must reflect the commit point.
+
+Append-only logs, streams, and database-managed files need their own append, recovery,
+or transactional protocols, not blanket whole-file replacement. Check their declared
+consistency guarantees rather than exempting them from failure handling.
+
 ### Wrapper and proxy correctness
 
 For caches, proxies, decorators, and adapters, check that methods route to the intended

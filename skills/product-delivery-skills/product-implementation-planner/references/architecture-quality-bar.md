@@ -32,6 +32,10 @@ Use this as a mandatory review checklist. Apply only the items relevant to the p
 
 - Interfaces, events, files, callbacks, and external integration contracts are explicit.
 - Validation, error models, pagination, filtering, ordering, concurrency behavior, and idempotency are defined where relevant.
+- If a CLI exists, define argument types, bounds, required/unknown/conflicting-option
+  behavior, exit statuses, diagnostic streams, and actionable usage errors with correction
+  guidance and relevant invocation examples. Locally invalid input is rejected before
+  operational side effects; help includes valid examples.
 - Versioning and backward-compatibility rules are defined.
 - Contract evolution and deprecation are planned.
 - Critical flows have sequence diagrams or equivalent step-by-step interaction descriptions.
@@ -65,6 +69,12 @@ Use this as a mandatory review checklist. Apply only the items relevant to the p
 - Side-effecting operations are idempotent or protected against duplication.
 - Queues have capacity limits, retry policy, dead-letter handling, monitoring, and replay procedures.
 - Partial failure and degraded-mode behavior are specified.
+- File-writing paths declare publication and recovery guarantees. Complete-file artifacts
+  use atomic publication with the previous version preserved until replacement; define
+  failure outcomes, cleanup, required crash durability, and concurrent-writer or multi-file
+  coordination. Use mechanisms supported by the target platform/filesystem. Append-only
+  logs, streams, and database-managed files use appropriate append/recovery/transaction
+  protocols rather than blanket file replacement.
 - Reconciliation exists where two systems can diverge.
 - Backups, restore tests, recovery-point objectives, recovery-time objectives, and disaster-recovery responsibilities are defined when relevant.
 - Single points of failure are accepted only when their risk is explicit and proportionate.
