@@ -1,32 +1,29 @@
 #!/bin/sh
 set -eu
-
 verification_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 check_dir=$(mktemp -d "${TMPDIR:-/tmp}/code-review-loop-state-space.XXXXXX")
 trap 'rm -rf "$check_dir"' EXIT HUP INT TERM
 
-expected_states='1127 states generated, 738 distinct states found, 0 states left on queue.'
-expected_depth='The depth of the complete state graph search is 23.'
-
-if ! TLC_CONFIG=CodeReviewLoop.cfg \
-    TLC_METADIR="$check_dir/states" \
-    "$verification_dir/run-tlc.sh" >"$check_dir/tlc.out" 2>&1; then
-    echo "The normal model failed before its state space could be checked:" >&2
-    sed -n '1,220p' "$check_dir/tlc.out" >&2
-    exit 1
-fi
-
-observed_states=$(sed -n '/ states generated, .* distinct states found, .* states left on queue\.$/p' "$check_dir/tlc.out" | tail -n 1)
-observed_depth=$(sed -n '/^The depth of the complete state graph search is /p' "$check_dir/tlc.out" | tail -n 1)
-
-if [ "$observed_states" != "$expected_states" ] || [ "$observed_depth" != "$expected_depth" ]; then
-    echo "The recorded TLC state space has changed." >&2
-    echo "Expected: $expected_states" >&2
-    echo "Observed: ${observed_states:-<missing>}" >&2
-    echo "Expected: $expected_depth" >&2
-    echo "Observed: ${observed_depth:-<missing>}" >&2
-    echo "Review the model change, then update this script and README.md together." >&2
-    exit 1
-fi
-
-echo "Expected state space confirmed: 1127 generated, 738 distinct, depth 23."
+while read -r config generated distinct depth; do
+    if ! TLC_CONFIG="$config" TLC_WORKERS=1 TLC_METADIR="$check_dir/states" \
+        "$verification_dir/run-tlc.sh" >"$check_dir/tlc.out" 2>&1; then
+        echo "Positive model failed: $config" >&2
+        cat "$check_dir/tlc.out" >&2
+        exit 1
+    fi
+    expected_states="$generated states generated, $distinct distinct states found, 0 states left on queue."
+    expected_depth="The depth of the complete state graph search is $depth."
+    if ! grep -Fq 'Model checking completed. No error has been found.' "$check_dir/tlc.out" \
+        || ! grep -Fxq "$expected_states" "$check_dir/tlc.out" \
+        || ! grep -Fxq "$expected_depth" "$check_dir/tlc.out"; then
+        echo "Recorded state space changed for $config; review the model and update the counts in this script." >&2
+        cat "$check_dir/tlc.out" >&2
+        exit 1
+    fi
+    echo "$config: $generated generated, $distinct distinct, depth $depth; all checks passed."
+done <<'MODELS'
+CodeReviewLoop.cfg 193067 64109 60
+CodeReviewLoopLiveness.cfg 193067 64109 60
+CodeReviewLoopRecovery.cfg 31004 11363 34
+CodeReviewLoopIsolation.cfg 10013519 2392041 49
+MODELS

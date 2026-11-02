@@ -1,139 +1,239 @@
-# Code Review Loop Formal Verification
+# Code Review Loop verification
 
-This directory contains the TLA+ state machine and reproducible TLC checks for the review protocol coordinated through one fixed shared directory.
-
-The skill package's [implementor CLI](../scripts/implementor_loop.py) and [reviewer CLI](../scripts/reviewer_loop.py) are the complete concrete protocol endpoints: they own channel publication and receipt, lock transitions, waits, acknowledgement, recovery, and cleanup. Their blocking wait commands inspect protocol state once per second and remain silent until an actionable state or protocol error occurs; role agents do not inspect the files directly.
-
-## Files
-
-- `CodeReviewLoop.tla` — state machine, safety invariants, fairness assumptions, and liveness properties.
-- `CodeReviewLoop.cfg` — normal TLC configuration with one bounded lock loss enabled.
-- `CodeReviewLoopEarlyUnlock.cfg` — negative mutation that unlocks before feedback publication.
-- `CodeReviewLoopTempFileEarlyUnlock.cfg` — negative mutation that unlocks after the reviewer temp write but before rename.
-- `CodeReviewLoopEarlyCompletionPublication.cfg` — negative mutation that publishes completion before cleanup finishes.
-- `run-tlc.sh` — digest-verifying TLC runner.
-- `check-state-space.sh` — guards the recorded state counts and graph depth.
-- `check-early-unlock.sh`, `check-temp-file-unlock.sh`, and `check-cleanup-order.sh` — ensure deliberately invalid transitions violate their intended properties.
-
-## Abstraction and file mapping
-
-The model treats the captured coordination directory as one abstract file namespace and keeps clean identifiers independent of the skill's `.hive_skills_` filesystem prefix:
-
-| Model field | Skill file |
-| --- | --- |
-| `files.reviewLock` | empty review-lock marker |
-| `files.implementorToReviewerTmp` | implementor-to-reviewer temp channel |
-| `files.implementorToReviewerTxt` | implementor-to-reviewer final channel |
-| `files.reviewerToImplementorTmp` | reviewer-to-implementor temp channel |
-| `files.reviewerToImplementorTxt` | reviewer-to-implementor final channel |
-| `files.roundComplete` | empty completion marker |
-
-The six file-presence fields are initialized independently, so TLC explores all 64 possible stale startup combinations. The implementor removes them one at a time, with completion removed last. The reviewer begins in `offline`; `StartReviewer` represents the external caller launching it only after startup cleanup completes. Reviewer-local participation is encoded by `pollingFresh` versus `pollingParticipated`, while the `request` record contains only per-request bookkeeping.
-
-Top-level state is factored into six canonical variables: the two actor states plus `files`, `content`, `request`, and `faults` records. Every action specifies the full next state of every top-level variable.
-
-The implementation and both channel bodies are abstracted to Boolean version bits. A finite `feedbackKind` records findings or the exact `NO_FINDINGS` sentinel. Concrete message text, the coordination-directory path, repository and context paths, path-equality validation, Python process lifetime, and filesystem calls are otherwise abstracted away. The lock and completion marker are presence-only signals and carry no data. A script's internal one-second poll that observes no actionable change is a stuttering step and is not modeled as a separate transition. Missing-lock recovery performed inside the implementor waiter is represented by `RetryMissingRequest`.
-
-## Modeled behavior
-
-The model covers:
-
-- cleanup from every possible combination of six stale startup files, with stale completion removed last;
-- externally ordered reviewer launch after startup cleanup;
-- logical waiting states, with idle script polls represented as stuttering and process blocking assumed rather than verified;
-- mandatory implementor context on every request, with an initial publication and later reuse or atomic refresh;
-- atomic publication for both directional channels;
-- opposite channel polarity: implementor publication while unlocked and reviewer publication while locked;
-- implementation and implementor-message freezing through a missing-lock retry gap;
-- one bounded lock deletion before reviewer acquisition or while a reviewer is active but undecided;
-- findings-or-`NO_FINDINGS` publication before every reviewer unlock;
-- implementor read/handling followed by a separate inbound-message acknowledgement;
-- another planned implementation phase after `NO_FINDINGS` without terminating the reviewer;
-- exactly one reviewer-channel decision per logical request;
-- final cleanup and completion publication through the implementor CLI only after `NO_FINDINGS`, whether the declared decision authority is the implementor or its caller;
-- completion acknowledgement by the participating reviewer and observation by the implementor-side endpoint used by the declared authority;
-- successful termination with all six files absent.
-
-The action relation assumes both agents and the role scripts follow the protocol. TLC checks compliant interleavings and explicitly enabled mutations; it does not establish that an LLM will invoke or keep waiting on the correct script process, limit protocol operations to the captured directory, or keep review activity static and read-only. The implementor's `completion-authority` is caller-versus-implementor control policy rather than file state: either authority uses the same implementor CLI transition, so the choice is abstracted from the model and is not an input to the reviewer.
-
-## Checked properties
-
-| Protocol requirement | TLA+ property |
-| --- | --- |
-| Actor states, records, counters, versions, and file markers remain in finite domains | `TypeOK` |
-| Reviewer launch occurs only after startup cleanup | `ReviewerStartsAfterStartupCleanup` |
-| Implementation cannot change while locked or through the same request's missing-lock retry gap | `ImplementationFrozenThroughReview` |
-| Submitted implementor context cannot appear, disappear, or change through that interval | `ImplementorMessageFrozenThroughReview` |
-| Implementor-channel temp/final publication is atomic and unlocked | `ImplementorMessagePublicationIsAtomic` |
-| Reviewer-channel temp/final publication is atomic and writer-owned | `ReviewerMessagePublicationIsAtomic` |
-| Reviewer temp publication starts while the lock exists | `ReviewerMessagePublicationStartsWhileLocked` |
-| Published reviewer contents remain unchanged until implementor acknowledgement | `ReviewerMessageFrozenUntilConsumed` |
-| Every undecided request carries a frozen implementor context | `ReviewRequestsIncludeImplementorContext` |
-| Reviewer decisions use the submitted implementation and mandatory context snapshot | `ReviewerUsesFrozenSnapshot` |
-| A reviewer cannot unlock before a complete reviewer final exists | `ReviewerMessagePublishedBeforeUnlock` |
-| Decision counts and findings/`NO_FINDINGS` kinds agree with file state | `DecisionAccounting` |
-| Lock, feedback, completion, and logical-request state remain correlated | `RequestStateIsConsistent` |
-| Feedback handling and outbound preparation require published reviewer feedback | `HandlingRequiresReviewerMessage` |
-| A published completion marker is the only remaining file while acknowledgement is pending | `CompletionHasPriority` |
-| Final cleanup and shutdown are reachable only from `NO_FINDINGS` | `CompletionRequiresNoFindings` |
-| The reviewer terminates only after acknowledging completion | `ReviewerTerminatesOnlyAfterCompletion` |
-| Successful termination removes all six working files | `SuccessfulTerminationIsClean` |
-| The declared authority, through the implementor endpoint, atomically promotes the final clean response to completion after the other four files are absent | `CompletionMarkerPublishedLast` |
-| Any completion-marker removal occurs only after the other five files are absent | `CompletionMarkerRemovedLast` |
-| Only the participating reviewer acknowledges normal completion | `CompletionAcknowledgedByParticipatingReviewer` |
-| Every logical request reaches exactly one decision before closing | `ExactlyOneDecisionPerLogicalRequest` |
-| Startup cleanup reaches a clean implementation state | `StartupCleanupEventuallyFinishes` |
-| The externally launched reviewer eventually becomes active | `ReviewerEventuallyStarts` |
-| Every live review lock eventually unlocks after a decision | `ReviewRequestEventuallyReleased` |
-| `NO_FINDINGS` eventually continues into another phase or shutdown | `NoFindingsEventuallyContinuesOrShutsDown` |
-| Reviewer messages are consumed, missing implementor context is published before review, and live temp publications complete | `ReviewerMessageEventuallyConsumed`, `ImplementorContextEventuallyAvailable`, `ReviewerMessageTempEventuallyPublished`, `ImplementorMessageTempEventuallyPublished` |
-| Completion is eventually acknowledged and both actors terminate | `CompletionEventuallyAcknowledged`, `ShutdownEventuallyFinishes` |
+This is active, bounded verification of the shared-dispatcher/session protocol in
+[the skill](../SKILL.md). It replaces the retired single-pair model; the old
+completion-marker cleanup checks are removed. No runtime protocol fields or features
+are added by this model. It complements the Python helper/process tests and real-agent
+exercises; it is not an exhaustive correctness proof of the Python, filesystem, runtime,
+or agent instructions.
 
 ## Run
 
-Java 11 or newer and a `tla2tools.jar` build are required:
+From this directory:
 
 ```sh
-./run-tlc.sh
+./check-all.sh
+```
+
+Or run checks separately:
+
+```sh
+./run-tlc.sh                                      # normal safety
+TLC_CONFIG=CodeReviewLoopRecovery.cfg ./run-tlc.sh
+TLC_CONFIG=CodeReviewLoopIsolation.cfg ./run-tlc.sh
+TLC_CONFIG=CodeReviewLoopLiveness.cfg ./run-tlc.sh
+python3 ./check-helper-decisions.py
 ./check-state-space.sh
-./check-early-unlock.sh
-./check-temp-file-unlock.sh
-./check-cleanup-order.sh
+./check-mutations.sh
+./check-witnesses.sh
+./check-liveness-limit.sh
 ```
 
-The normal run must finish without errors. The state-space check reruns it and fails if the recorded counts or depth change. The final three commands enable deliberately invalid actions and succeed only when TLC reports the intended property violation.
+Java 11+ and `tla2tools.jar` are required. The runner retains the pinned build
+`2026.08.11.125311-0894c34`, SHA-256
+`ab323b79802aedc3203b3f9af37c6aca3ed43f4e0225b36f2aa77b26de46c05f`, built from
+[upstream revision `0894c3407f4717fec7cc18bde3bf3c857fa47333`](https://github.com/tlaplus/tlaplus/tree/0894c3407f4717fec7cc18bde3bf3c857fa47333).
+Override with `JAVA_BIN`, `TLA2TOOLS_JAR`, and `TLA2TOOLS_SHA256` when needed; an
+unverified custom jar produces a warning. `TLC_WORKERS` defaults to 1, and
+`TLC_COVERAGE=1` adds coverage. Each run gets a private temporary state directory,
+removed on exit; `TLC_METADIR` explicitly selects a retained directory instead.
+`TLC_MODEL` is used by the helper-parity check for its temporary instrumented copy.
+These checks never start a dispatcher or inspect a coordination directory.
 
-Override tool discovery when needed:
+[`check-state-space.sh`](check-state-space.sh) is the single source of exact recorded
+state counts and depths for all four positive configurations. It prints and checks
+them on each run. Unexpected tool failures fail the
+suite. The negative and witness scripts require their exact expected TLC diagnostic;
+an arbitrary nonzero exit is not success. The two older unlock check entrypoints
+remain as shortcuts to their updated mutations.
+
+## Model and implementation correspondence
+
+`CodeReviewLoop.tla` uses `q[session]` for independent session state and `service` for
+dispatcher state. Session IDs and channel owners are distinct TLC model values; handles
+are session-local ordinals (the abstract runtime handle is the session/ordinal pair).
+There is no source-directory comparison or source isolation guarantee.
+
+Session separation holds **by construction** in this abstraction: every local action
+updates only its indexed session record. `SessionIsolation` is a structural assertion,
+not an independent isolation proof. The wrong-routing mutation demonstrates that the
+owner tag check rejects an injected mismatch; it does not verify filesystem routing.
+Concrete isolation evidence comes from
+[`test_three_sessions_and_followup_rounds_remain_independent`](../scripts/test_sessions.py)
+and the session-path validation tests, which exercise the Python scripts and folders.
+
+| Model state/action | Current implementation |
+| --- | --- |
+| `contextTemp`, `context`; `PrepareContext`, `PromoteContext` | `implementor_loop.publish_context`: prepare/remove old output, write temp, promote complete context |
+| `dispatch`, `lock`; `QueueDispatch`, `RequestReview` | `implementor_loop.request_review` queues a dispatch marker before publishing the review-lock marker; locked retries do not requeue |
+| `ReadRequest`, `workerPC`, `reviewedRound` | Worker receives its assigned session's complete handoff and performs static review |
+| `responseTemp`, `response`; `WriteResponseTemp`, `PromoteResponse` | `reviewer_loop.publish_response`: replace an unfinished temp, then atomically publish findings or `NO_FINDINGS` |
+| `RecoverPublishedResponse`, `ReleaseReview` | `read_request` returns `review_ready_to_release`; `release_review` releases an existing final without publishing a second decision |
+| `FinishTurn`, `deferred` | Worker ends its turn; a runtime completion notification clears the dispatcher's `--busy-session` deferral |
+| `ConsumeResponse`, `Acknowledge` | Implementor `wait_for_review`, then `acknowledge_feedback` |
+| `close`, `closed`; `RequestClose`, `WorkerSeesClose` | Session `close-request`, worker exits its role, dispatcher records `state.json` status only after stop confirmation |
+| `Decide`, `Dispatch`, `error`, `command` | `dispatcher_loop.decide_action`, `reconcile`, pending runtime action, error suppression in `pending_events` |
+| `RuntimeLaunchBind`, `RuntimeResume`, `RuntimeStop` | External runtime outcomes; dispatch is acknowledged before calling the runtime, bind records a new handle, stop confirmation permits closure |
+| `StartService`, `OperatorRevive`, `service.recover` | `start` lists every open session and clears conversation-local deferrals; idle conversations stay dormant, explicit `--revive` retries pending work |
+| `BeginShutdown`, `RetryShutdown`, `FinishShutdown` | `shutdown` uses fresh statuses, keeps the marker on stop/error, preserves open channels, removes marker only on completion |
+
+The model's `Decide` branch order is checked against the **actual Python function**
+for all 384 combinations of open/closed, close request, handle presence, pending review,
+dispatch marker, shutdown, and the six runtime-status inputs. This parity check calls only the pure
+`decide_action` function. It does not establish parity for other Python functions.
+
+All sessions begin as fresh open channels. They can submit before service startup.
+`service.mode = "off"` means the marker is absent; `"down"` means an interrupted
+service whose marker remains. Plain start is enabled only from `off`. `OperatorRevive`
+is explicit external intervention, including in an existing dispatcher conversation;
+there is no automatic supervision transition for silently lost bound workers.
+
+Every round is dispatched once during healthy execution. The dispatcher acknowledges
+the dispatch marker before the runtime call, so bind cannot erase a fast follow-up
+request. A submitted follow-up can arrive while the worker is finishing its previous
+turn; `await_worker` defers that session until runtime completion notification. The
+model represents that notification together with `FinishTurn`; actual notification
+delivery is a host assumption, not something Python observes. Idle workers do not wait
+or resume. A pending
+close takes precedence over resume/replacement decisions. A close arriving after an
+already-issued launch decision can still be followed by bind and then stop, matching
+the helper's close-aware bind result. A launch/stop/observation error leaves the session
+for later recovery, while a close can still wake a session with an earlier launch error.
+
+Channel promotion and lock release are separate transitions. Worker interruption can
+leave a response temp or a promoted final behind. Recovery can replace a temp, but must
+release a complete final unchanged, without another decision. An interrupted implementor
+publication is represented by remaining in `contextTemp`; restarting its publication
+removes/replaces that temp before promotion. Command retries that leave the abstract
+state unchanged and polling without events are stuttering steps.
+
+Shutdown does not close an otherwise open session or consume feedback. A subsequent
+plain start retains idle conversations, and resumes or replaces only for pending work.
+During closure/shutdown, a completed resumable worker is observed as `stopped` and
+needs no redundant stop call. `RuntimeStop` handles execution that is still active.
+`ObserveResumeAvailable` represents a fresh startup observation that a previously
+stopped idle/open conversation can now be resumed; it does not restart execution.
+Until explicit cleanup, closed sessions retain channel data, including a lock/temp/final from cancellation.
+Closure is **not approval** and is not evidence of `NO_FINDINGS` or successful tests.
+The wrapper's terminal-result validation remains outside this model. Fresh mode uses
+one round per session and closes it after feedback; reuse mode permits later rounds
+on the same handle. The finite model covers both sequences, but does not enforce an
+implementor's mode choice or generate an unbounded supply of fresh sessions.
+
+## Bounds and checked results
+
+The positive checks completed on 2026-11-04 using the pinned TLC build. These are
+finite state spaces, not a proof for arbitrary numbers of sessions or rounds.
+
+| Configuration | Sessions | Rounds/session | Handle ordinals/session | Fault budget | Service lifecycle |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `CodeReviewLoop.cfg` | 2 | 2 | 1 | 0 | Startup and session closure |
+| `CodeReviewLoopLiveness.cfg` | 2 | 2 | 1 | 0 | Startup and session closure |
+| `CodeReviewLoopRecovery.cfg` | 1 | 1 | 2 | 1 | Shutdown, start, revive |
+| `CodeReviewLoopIsolation.cfg` | 2 | 1 | 1 | 1 | Shutdown, start, revive |
+
+One shared fault budget permits at most one runtime-call failure, worker interruption
+(to resumable or gone), or dispatcher interruption. Successful shutdown/start/revive
+may repeat within the finite state space. Handle ordinals are never reused. Reaching
+the configured handle bound can leave a replacement action blocked; this is a modeling
+cutoff, not a runtime capacity rule. Replacement recovery is checked in the one-session,
+two-handle configuration; the two-session recovery check explores concurrent lifecycle
+interleavings in structurally separate records and same-handle resume.
+No liveness claim is made for either fault configuration. `CHECK_DEADLOCK FALSE`
+allows idle sessions, reached bounds, and waits requiring external intervention;
+the separate temporal properties check the progress that is actually promised.
+
+Safety checks cover:
+
+- typed state, complete submitted context, frozen pending context, and response tags
+  matching the assigned session and round;
+- at most one final publication per round, publication before unlock, and feedback
+  preservation until explicit implementor acknowledgement;
+- no new acceptance once close is requested, closed sessions staying closed, and
+  closure requiring both a close request and a stopped/gone worker;
+- handle replacement only after the old worker is unavailable, and no workers left
+  active when clean service shutdown has removed the marker;
+- starting/resuming a worker only for a pending review, with dormant idle conversations.
+
+`check-mutations.sh` verifies that these checks reject seven deliberate faults:
+unlock before any response, unlock with a response temp, wrong-session delivery,
+closure before stop, feedback deletion during recovery, replacing a running worker,
+and treating service shutdown as session closure.
+
+`check-witnesses.sh` requires actual reachable traces for concurrent reviews,
+two accepted rounds on the first handle, deferral of a follow-up while its worker is
+finishing, recovery after interruption at the response temp and final boundaries,
+idle-conversation retention after shutdown/start, and replacement when another round
+arrives afterward. Specification-only `interruptedAt` and
+`idleShutdownHandle` records tie these witnesses to those exact histories; they are
+not runtime bookkeeping. The restart witnesses require an idle bound conversation
+captured by that shutdown, retained on restart, and either left dormant or replaced
+for a second submitted round.
+
+## Liveness and external assumptions
+
+Only `CodeReviewLoopLiveness.cfg` asserts progress: every submitted round eventually
+has feedback consumed or closure confirmed, and every close request is eventually
+confirmed. It assumes no failures, no service shutdown, eventual service startup,
+and weak fairness of each session's pair progress, dispatcher handling, and successful
+runtime operations. It does not require the operator to choose closure, nor claim that
+all tasks eventually receive clean feedback or succeed.
+
+`check-liveness-limit.sh` intentionally disproves `LostWorkerEventuallyRecovers` with
+one possible worker loss, no operator revive/shutdown, and otherwise fair actors.
+The trace reaches a bound worker that is gone and can stutter indefinitely: its round
+was already dispatched and worker-loss notification is absent. The spare handle remains available, so this is
+not a counterexample caused by the bounded handle supply. This is an expected protocol
+limit, not an implementation defect or a reason to add automatic lost-worker detection.
+
+The model assumes:
+
+- one dispatcher per coordination directory, one compliant implementor per session,
+  unique runtime handles, and no stale worker executing after confirmed stop;
+- truthful runtime observations and stable stop/launch/resume outcomes at their modeled
+  boundaries; a stop confirms both the worker and its active tool processes ended;
+- completion notifications for healthy finishing workers, clearing busy-session
+  deferrals without model-driven runtime polling; lost notifications require revive;
+- the old dispatcher and its waiter are stopped before operator revival; the marker
+  itself neither proves liveness nor enforces ownership;
+- each participant uses the correct session script and keeps source/context frozen
+  until feedback consumption or confirmed cancellation. Source contents, static-review
+  quality, and agent obedience are assumptions, not mechanically checked behavior.
+
+The Python scripts perform filesystem checks and subsequent writes/removals separately.
+The model **does not prove those sequences atomic**: guards and each modeled file effect
+are one abstract step. In particular, it does not check a close arriving between a
+script's final open check and file mutation, stale snapshot races, partial writes,
+power-loss durability, corrupt/missing channels, or external lock deletion. Atomic
+rename is assumed. It also combines successful runtime launch and handle bind; a failed
+bind must stop the unrecorded worker before further dispatch. Crashes or failed stops
+inside that unrecorded-worker window are outside the abstraction. Dispatcher operations
+on distinct sessions may interleave, an abstraction of independent session work; service
+shutdown starts only after pending runtime operations finish.
+
+Python regression tests cover stray directory entries, per-session corruption reports
+that complete a wait even on hosts with buffered output, suppression of already-reported
+errors while healthy sessions continue, and an implementor waiter rejecting absent
+requests without creating a lock. Process tests also cover immediate worker reads,
+dispatch acknowledgement before a fast follow-up, busy-session deferral without
+hiding closure/errors, fresh-session closure, and same-handle continuation. These
+runtime/file details are
+outside the TLA+ fault model. A broken session does not abort scans of healthy sessions;
+unreadable state still prevents claiming successful service shutdown.
+The explicit `cleanup-closed` command removes terminal session directories after
+consumers finish their closure checks. Deleting terminal artifacts is outside this
+model; Python tests cover closed-only deletion, concurrent scanning, failure reporting,
+and retry after interrupted deletion. The modeled active-session decisions are unchanged.
+
+Maintain the model, parity check, bounds, mutations, and recorded counts alongside
+protocol changes. Run the Python suites as well:
 
 ```sh
-JAVA_BIN=/path/to/java \
-TLA2TOOLS_JAR=/path/to/tla2tools.jar \
-TLA2TOOLS_SHA256=expected-digest \
-./run-tlc.sh
+python3 -m unittest discover -s ../scripts -p 'test_*.py'
+python3 -m unittest discover -s ../../parallel-code-review-loop/scripts -p 'test_*.py'
 ```
 
-The runner verifies the pinned default jar's SHA-256 digest. A custom jar is verified when `TLA2TOOLS_SHA256` is supplied; otherwise the runner warns. `TLC_METADIR` selects the state directory, and `TLC_COVERAGE=1` enables action coverage.
-
-The recorded 2026-08-26 normal run completed without errors after generating 1,127 states, finding 738 distinct states, and reaching graph depth 23. TLC checked eleven temporal-property branches. All three negative mutation checks produced their expected violations.
-
-Coverage confirms both lock-loss locations and retry: `LosePollingLock`, `LoseActiveReviewLock`, and `RetryMissingRequest` are reachable. Both reviewer outcomes and both implementor choices after them are reachable, as are `PublishCompletion`, `AcknowledgeCompletion`, and `ObserveCompletionAcknowledged`. `RemoveCleanupReviewerTmp` and `RemoveCleanupImplementorTmp` remain at `0:0` because compliant publication ordering makes both temp files absent before final cleanup; they remain defensive actions matching the skill's remove-if-present instructions. Arbitrary stale temp cleanup is exercised during startup.
-
-## Fault-model limits
-
-The simplified protocol intentionally delegates lifecycle isolation to external orchestration. The model assumes the implementor completes startup cleanup before the reviewer is launched and that no reviewer from an older loop remains active. Because the files carry no IDs or generation tags, a stale live agent could otherwise interfere with a new loop; that behavior is outside the model rather than silently claimed as verified.
-
-Filesystem checks and subsequent writes or removals are separate real calls but single TLA+ actions. The model therefore does not prove compare-and-act atomicity. It does exercise one bounded lock deletion while the reviewer is polling, reviewing, or publishing, and proves that retry preserves the same frozen logical request. Repeated deletions and arbitrary lock loss after a decision are not modeled.
-
-After startup, temp files are reachable only while their compliant publisher is active. Fairness lets `AbortReviewAfterLockLoss` clear a reviewer temp before retry. TLC verifies that the implementor context file exists and remains frozen; it abstracts the required absolute paths, task source or full text, evidence explanation, and implementor notes rather than interpreting their prose. It also abstracts the review itself, so it does not prove that the reviewer avoids builds, tests, execution, or writes outside the protocol files, nor that it prioritizes substantive correctness over compilation concerns. TLC is untimed and does not model the scripts' one-second poll interval, their 90-second stale-state grace period, process interruption by an execution environment, arbitrary findings text, or whether an LLM understands and correctly acts on a message it read.
-
-The completion CLI retains the clean reviewer final as a durable phase record while removing the other files, empties it, and atomically renames that same filesystem entry to the completion marker. The `PublishCompletion` action models that final atomic promotion. If the process is interrupted before or after the rename, replay can distinguish the retained reviewer final, the published marker, and an already-acknowledged all-absent state. TLC verifies only this common post-authorization file transition; it does not verify who chose to close a caller-owned session or the control-plane handback itself.
-
-The model assumes the participating reviewer remains live long enough to remove the completion marker. The implementor script now waits indefinitely for that acknowledgement unless the operator or execution environment interrupts it; interruption and restart behavior are outside the model.
-
-The fault budget permits one environmental lock deletion before a reviewer decision. Early unlocks and early completion publication are enabled only by their negative configurations.
-
-## Verified tool identity
-
-The local verification used OpenJDK 25.0.2 and an untagged TLA+ master build whose manifest reports `Implementation-Version: 2.0 2026-08-11`, an empty `X-Git-Tag`, and revision [`0894c3407f4717fec7cc18bde3bf3c857fa47333`](https://github.com/tlaplus/tlaplus/commit/0894c3407f4717fec7cc18bde3bf3c857fa47333), with TLC banner `2026.08.11.125311`. Its SHA-256 digest is `ab323b79802aedc3203b3f9af37c6aca3ed43f4e0225b36f2aa77b26de46c05f`, which `run-tlc.sh` verifies before launching the pinned default binary.
-
-This binary came from the mutable Clarke `v1.8.0` pre-release channel; `v1.8.0` is not its implementation version and the channel asset is not a durable content pin. Reproduce the run with the exact digest above or build the referenced source revision.
+The Python tests exercise real helper/channel/process behavior that this state machine
+abstracts. Real-agent exercises remain necessary for background notification delivery,
+one-round worker behavior, actual idle token cost, and host-specific conversation
+resume/replace behavior. No new live-agent billing measurement is claimed here.

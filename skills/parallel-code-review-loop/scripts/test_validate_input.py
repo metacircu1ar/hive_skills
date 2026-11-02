@@ -1,108 +1,99 @@
 #!/usr/bin/env python3
-"""Tests for parallel-code-review-loop input validation."""
+"""Input checks for the shared-dispatcher wrapper."""
 
-from __future__ import annotations
-
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from validate_input import InputError, validate_manifest  # noqa: E402
+from validate_input import InputError, validate_manifest
 
 
 class ValidateInputTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.workspace = Path(self.temporary.name).resolve()
-        self.repo_a = self.workspace / "repo-a"
-        self.repo_b = self.workspace / "repo-b"
-        self.repo_a.mkdir()
-        self.repo_b.mkdir()
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
 
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
+    def tearDown(self):
+        self.tmp.cleanup()
 
-    def manifest(self) -> dict[str, object]:
+    def manifest(self):
         return {
-            "general_context": {"objective": "Complete the epic"},
+            "coordination_dir": str(self.root),
+            "general_context": {"task": "Shared requirements"},
             "assignments": [
                 {
                     "id": "task-a",
-                    "working_path": str(self.repo_a),
-                    "agent_context": {"task": "Implement A"},
+                    "working_path": str(self.root),
+                    "agent_context": "Task A",
                 },
                 {
                     "id": "task b / provider-hostile",
-                    "working_path": str(self.repo_b),
-                    "agent_context": {"task": "Implement B"},
+                    "working_path": str(self.root),
+                    "agent_context": "Task B",
                 },
             ],
         }
 
-    def test_valid_manifest_derives_capacity_and_safe_names(self) -> None:
-        manifest = self.manifest()
-        manifest["max_parallel_pairs"] = 8
-
-        result = validate_manifest(manifest, confirmed_worker_slots=4)
-
+    def test_shared_coordination_and_names_need_no_capacity_input(self):
+        result = validate_manifest(self.manifest())
+        self.assertEqual(result["coordination_dir"], str(self.root))
         self.assertEqual(result["assignment_count"], 2)
-        self.assertEqual(result["pair_capacity"], 2)
-        self.assertEqual(result["effective_parallel_pairs"], 2)
-        self.assertFalse(result["waves_required"])
-        names = [
-            item[key]
-            for item in result["assignments"]
-            for key in ("implementor_launch_name", "reviewer_launch_name")
-        ]
+        names = [a["implementor_launch_name"] for a in result["assignments"]]
         self.assertEqual(len(names), len(set(names)))
-        self.assertTrue(all(name.replace("_", "").isalnum() for name in names))
+        self.assertTrue(all(n.replace("_", "").isalnum() for n in names))
 
-    def test_pair_limit_requires_a_positive_integer(self) -> None:
-        for invalid in (None, 0, -1, True, 1.5, "2"):
-            with self.subTest(invalid=invalid):
-                manifest = self.manifest()
-                manifest["max_parallel_pairs"] = invalid
-                with self.assertRaisesRegex(InputError, "max_parallel_pairs"):
-                    validate_manifest(manifest, confirmed_worker_slots=4)
-
-    def test_at_least_two_confirmed_worker_slots_are_required(self) -> None:
-        with self.assertRaisesRegex(InputError, "at least 2"):
-            validate_manifest(self.manifest(), confirmed_worker_slots=1)
-
-    def test_duplicate_working_roots_are_rejected(self) -> None:
+    def test_session_mode_defaults_to_fresh_and_accepts_explicit_reuse(self):
         manifest = self.manifest()
-        manifest["assignments"][1]["working_path"] = str(self.repo_a)
+        self.assertEqual(validate_manifest(manifest)["session_mode"], "fresh")
+        manifest["session_mode"] = "reuse"
+        self.assertEqual(validate_manifest(manifest)["session_mode"], "reuse")
+        for invalid in (None, "", "same", True, [], {}):
+            manifest["session_mode"] = invalid
+            with self.assertRaisesRegex(InputError, "session_mode"):
+                validate_manifest(manifest)
 
-        with self.assertRaisesRegex(InputError, "overlaps"):
-            validate_manifest(manifest, confirmed_worker_slots=4)
-
-    def test_nested_working_roots_are_rejected(self) -> None:
-        nested = self.repo_a / "nested-repo"
+    def test_source_paths_are_not_compared(self):
+        manifest = self.manifest()
+        validate_manifest(manifest)  # Equal paths are the operator's concern.
+        nested = self.root / "nested"
         nested.mkdir()
-        manifest = self.manifest()
         manifest["assignments"][1]["working_path"] = str(nested)
+        validate_manifest(manifest)
+        alias = self.root / "alias"
+        alias.symlink_to(nested, target_is_directory=True)
+        manifest["assignments"][0]["working_path"] = str(alias)
+        validate_manifest(manifest)
 
-        with self.assertRaisesRegex(InputError, "overlaps"):
-            validate_manifest(manifest, confirmed_worker_slots=4)
+    def test_obsolete_capacity_options_are_rejected(self):
+        for name in ("max_parallel_pairs", "confirmed_worker_slots"):
+            manifest = self.manifest()
+            manifest[name] = 2
+            with self.assertRaisesRegex(InputError, "no longer supported"):
+                validate_manifest(manifest)
 
-    def test_relative_working_root_is_rejected(self) -> None:
+    def test_coordination_directory_is_required_and_absolute(self):
+        for value in (None, "", "relative"):
+            manifest = self.manifest()
+            manifest["coordination_dir"] = value
+            with self.assertRaisesRegex(InputError, "coordination_dir"):
+                validate_manifest(manifest)
+
+    def test_task_identity_and_context_remain_required(self):
         manifest = self.manifest()
-        manifest["assignments"][0]["working_path"] = "repo-a"
-
-        with self.assertRaisesRegex(InputError, "must be absolute"):
-            validate_manifest(manifest, confirmed_worker_slots=4)
-
-    def test_insufficient_capacity_never_produces_a_zero_pair_plan(self) -> None:
+        manifest["assignments"][1]["id"] = "task-a"
+        with self.assertRaisesRegex(InputError, "duplicate"):
+            validate_manifest(manifest)
         manifest = self.manifest()
-        manifest["max_parallel_pairs"] = 1
+        manifest["assignments"][0]["agent_context"] = ""
+        with self.assertRaisesRegex(InputError, "agent_context"):
+            validate_manifest(manifest)
 
-        result = validate_manifest(manifest, confirmed_worker_slots=2)
-
-        self.assertEqual(result["effective_parallel_pairs"], 1)
-        self.assertTrue(result["waves_required"])
+    def test_each_source_directory_still_must_exist_and_be_absolute(self):
+        for value in ("relative", str(self.root / "missing")):
+            manifest = self.manifest()
+            manifest["assignments"][0]["working_path"] = value
+            with self.assertRaisesRegex(InputError, "working_path"):
+                validate_manifest(manifest)
 
 
 if __name__ == "__main__":

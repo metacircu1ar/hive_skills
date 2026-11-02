@@ -18,6 +18,7 @@ import implementor_loop
 import review_loop_protocol
 import reviewer_loop
 from review_loop_protocol import (
+    DISPATCH_REQUEST,
     IMPLEMENTOR_FINAL,
     IMPLEMENTOR_TEMP,
     POLL_INTERVAL_SECONDS,
@@ -25,7 +26,6 @@ from review_loop_protocol import (
     REVIEW_LOCK,
     REVIEWER_FINAL,
     REVIEWER_TEMP,
-    ROUND_COMPLETE,
     ProtocolError,
     create_empty_marker,
     remove_exact,
@@ -59,7 +59,8 @@ class BackgroundCall:
 class ReviewLoopScriptTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.coordination_directory = Path(self.temporary.name).resolve()
+        self.workspace = Path(self.temporary.name).resolve()
+        self.coordination_directory = review_loop_protocol.open_session(self.workspace)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -69,7 +70,16 @@ class ReviewLoopScriptTests(unittest.TestCase):
         path.write_text(body, encoding="utf-8")
         return path
 
+    def session_arguments(self, arguments: tuple[str, ...]) -> list[str]:
+        args = list(arguments)
+        if "--coordination-dir" in args:
+            index = args.index("--coordination-dir") + 1
+            args[index] = str(self.workspace)
+            args.extend(("--session", self.coordination_directory.name))
+        return args
+
     def start_cli(self, script_name: str, *arguments: str) -> subprocess.Popen[str]:
+        arguments = self.session_arguments(arguments)
         script = Path(__file__).resolve().parent / script_name
         return subprocess.Popen(
             [sys.executable, str(script), *arguments],
@@ -85,6 +95,7 @@ class ReviewLoopScriptTests(unittest.TestCase):
         *arguments: str,
         input_text: Optional[str] = None,  # noqa: UP045
     ) -> dict[str, object]:
+        arguments = self.session_arguments(arguments)
         script = Path(__file__).resolve().parent / script_name
         completed = subprocess.run(
             [sys.executable, str(script), *arguments],
@@ -99,81 +110,6 @@ class ReviewLoopScriptTests(unittest.TestCase):
 
     def test_poll_interval_is_one_second(self) -> None:
         self.assertEqual(POLL_INTERVAL_SECONDS, 1.0)
-
-    def test_public_clis_cover_a_clean_round_without_manual_file_operations(
-        self,
-    ) -> None:
-        common = ("--coordination-dir", str(self.coordination_directory))
-
-        self.assertEqual(
-            self.run_cli("implementor_loop.py", "startup-cleanup", *common)["event"],
-            "startup_cleanup_complete",
-        )
-        self.assertEqual(
-            self.run_cli(
-                "implementor_loop.py",
-                "publish-context",
-                *common,
-                "--message-stdin",
-                input_text="complete context",
-            )["event"],
-            "context_published",
-        )
-        self.run_cli("implementor_loop.py", "request-review", *common)
-        request = self.run_cli(
-            "reviewer_loop.py", "wait-for-request", *common, "--fresh"
-        )
-        self.assertEqual(request["message"], "complete context")
-        self.run_cli(
-            "reviewer_loop.py",
-            "publish-response",
-            *common,
-            "--message-stdin",
-            input_text="NO_FINDINGS",
-        )
-        result = self.run_cli("implementor_loop.py", "wait-for-review", *common)
-        self.assertEqual(result["message"], "NO_FINDINGS")
-        self.run_cli("implementor_loop.py", "complete", *common)
-        self.assertEqual(
-            self.run_cli(
-                "reviewer_loop.py",
-                "wait-for-request",
-                *common,
-                "--participated",
-            )["event"],
-            "completion",
-        )
-        self.run_cli(
-            "reviewer_loop.py",
-            "acknowledge-completion",
-            *common,
-            "--participated",
-        )
-        self.run_cli("implementor_loop.py", "wait-for-completion", *common)
-        self.assertEqual(snapshot(self.coordination_directory).present_names(), [])
-
-    def test_startup_cleanup_removes_only_protocol_files(self) -> None:
-        for name in PROTOCOL_FILES:
-            self.write(name, "" if name in (REVIEW_LOCK, ROUND_COMPLETE) else "stale")
-        unrelated = self.write("keep-me.txt", "keep")
-
-        implementor_loop.startup_cleanup(self.coordination_directory)
-
-        self.assertEqual(snapshot(self.coordination_directory).present_names(), [])
-        self.assertEqual(unrelated.read_text(encoding="utf-8"), "keep")
-
-    def test_startup_cleanup_removes_malformed_nonempty_markers(self) -> None:
-        lock = self.write(REVIEW_LOCK, "stale lock contents")
-        completion = self.write(ROUND_COMPLETE, "stale completion contents")
-
-        with self.assertRaisesRegex(ProtocolError, "marker must be empty"):
-            snapshot(self.coordination_directory)
-
-        implementor_loop.startup_cleanup(self.coordination_directory)
-
-        self.assertFalse(lock.exists())
-        self.assertFalse(completion.exists())
-        self.assertEqual(snapshot(self.coordination_directory).present_names(), [])
 
     def test_marker_creation_does_not_require_a_post_creation_path_lookup(self) -> None:
         with mock.patch.object(
@@ -204,6 +140,7 @@ class ReviewLoopScriptTests(unittest.TestCase):
     def test_prepare_context_removes_only_implementor_outputs(self) -> None:
         self.write(IMPLEMENTOR_TEMP, "partial")
         self.write(IMPLEMENTOR_FINAL, "stale")
+        self.write(DISPATCH_REQUEST)
         unrelated = self.write("keep-me.txt", "keep")
 
         implementor_loop.prepare_context(self.coordination_directory)
@@ -211,6 +148,7 @@ class ReviewLoopScriptTests(unittest.TestCase):
         state = snapshot(self.coordination_directory)
         self.assertFalse(state.implementor_temp)
         self.assertFalse(state.implementor_final)
+        self.assertFalse(state.dispatch_requested)
         self.assertEqual(unrelated.read_text(encoding="utf-8"), "keep")
 
     def test_prepare_context_rejects_unacknowledged_feedback(self) -> None:
@@ -270,6 +208,31 @@ class ReviewLoopScriptTests(unittest.TestCase):
         state = snapshot(self.coordination_directory)
         self.assertTrue(state.review_lock)
         self.assertTrue(state.implementor_final)
+        self.assertTrue(state.dispatch_requested)
+
+    def test_submission_replays_after_interruption_between_dispatch_and_lock(
+        self,
+    ) -> None:
+        self.write(IMPLEMENTOR_FINAL, "context")
+        real_create = create_empty_marker
+
+        def interrupt_before_lock(directory, name):
+            if name == REVIEW_LOCK:
+                raise OSError("interrupted")
+            real_create(directory, name)
+
+        with (
+            mock.patch.object(
+                implementor_loop, "create_empty_marker", interrupt_before_lock
+            ),
+            self.assertRaisesRegex(OSError, "interrupted"),
+        ):
+            implementor_loop.request_review(self.coordination_directory)
+        state = snapshot(self.coordination_directory)
+        self.assertTrue(state.dispatch_requested)
+        self.assertFalse(state.review_lock)
+        implementor_loop.request_review(self.coordination_directory)
+        self.assertTrue(snapshot(self.coordination_directory).review_lock)
 
     def test_implementor_wait_stays_blocked_until_review_result(self) -> None:
         self.write(IMPLEMENTOR_FINAL, "context")
@@ -319,115 +282,65 @@ class ReviewLoopScriptTests(unittest.TestCase):
         self.assertEqual(payload["result_kind"], "no_findings")
         self.assertNotIn("message_path", payload)
 
-    def test_implementor_wait_recreates_a_missing_lock(self) -> None:
+    def test_implementor_wait_never_submits_an_unrequested_round(self) -> None:
+        with self.assertRaisesRegex(ProtocolError, "no review requested"):
+            implementor_loop.wait_for_review(self.coordination_directory)
         self.write(IMPLEMENTOR_FINAL, "context")
-        lock = self.write(REVIEW_LOCK)
-        call = BackgroundCall(
-            lambda: implementor_loop.wait_for_review(
-                self.coordination_directory, poll_interval=0.01
+        with self.assertRaisesRegex(ProtocolError, "no review requested"):
+            implementor_loop.wait_for_review(self.coordination_directory)
+        self.assertFalse(snapshot(self.coordination_directory).review_lock)
+
+    def test_implementor_wait_reports_deleted_lock_without_recreating_it(self) -> None:
+        self.write(IMPLEMENTOR_FINAL, "context")
+        self.write(REVIEW_LOCK)
+        with self.assertRaisesRegex(ProtocolError, "no review requested"):
+            implementor_loop.wait_for_review(
+                self.coordination_directory,
+                sleep_fn=lambda _: remove_exact(
+                    self.coordination_directory, (REVIEW_LOCK,)
+                ),
             )
-        )
+        self.assertFalse(snapshot(self.coordination_directory).review_lock)
 
-        lock.unlink()
-        deadline = time.monotonic() + 1
-        while not lock.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertTrue(lock.exists(), "missing review lock was not recreated")
-
-        self.write(REVIEWER_FINAL, "NO_FINDINGS")
-        lock.unlink()
-        call.join_cleanly(self)
-
-    def test_reviewer_wait_stays_blocked_until_valid_request(self) -> None:
+    def test_reviewer_read_returns_immediately_without_request(self) -> None:
         with mock.patch.object(reviewer_loop, "emit") as emit_mock:
-            call = BackgroundCall(
-                lambda: reviewer_loop.wait_for_request(
-                    self.coordination_directory,
-                    participated=False,
-                    poll_interval=0.01,
-                )
-            )
-
-            time.sleep(0.04)
-            call.assert_running(self)
-            emit_mock.assert_not_called()
-            self.write(IMPLEMENTOR_FINAL, "context")
-            self.write(REVIEW_LOCK)
-
-            call.join_cleanly(self)
+            reviewer_loop.read_request(self.coordination_directory)
             self.assertEqual(emit_mock.call_count, 1)
+            self.assertEqual(emit_mock.call_args.kwargs["event"], "no_request")
 
-    def test_reviewer_cli_process_blocks_until_request(self) -> None:
-        process = self.start_cli(
+    def test_reviewer_cli_reads_once_and_exits_even_when_idle(self) -> None:
+        self.assertEqual(
+            self.run_cli(
+                "reviewer_loop.py",
+                "read-request",
+                "--coordination-dir",
+                str(self.coordination_directory),
+            )["event"],
+            "no_request",
+        )
+        self.write(IMPLEMENTOR_FINAL, "context")
+        self.write(REVIEW_LOCK)
+        payload = self.run_cli(
             "reviewer_loop.py",
-            "wait-for-request",
+            "read-request",
             "--coordination-dir",
             str(self.coordination_directory),
-            "--fresh",
         )
-        try:
-            time.sleep(0.2)
-            self.assertIsNone(
-                process.poll(), "reviewer CLI returned after an idle poll"
-            )
-            self.write(IMPLEMENTOR_FINAL, "context")
-            self.write(REVIEW_LOCK)
-            stdout, stderr = process.communicate(timeout=3)
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait(timeout=2)
-
-        self.assertEqual(process.returncode, 0, stderr)
-        payload = json.loads(stdout)
         self.assertEqual(payload["event"], "review_request")
         self.assertEqual(payload["message"], "context")
         self.assertNotIn("message_path", payload)
 
-    def test_participating_reviewer_observes_completion(self) -> None:
-        self.write(ROUND_COMPLETE)
-        reviewer_loop.wait_for_request(
-            self.coordination_directory,
-            participated=True,
-            poll_interval=0.01,
-        )
-
-    def test_reviewer_retries_a_transitional_completion_snapshot(self) -> None:
-        self.write(REVIEWER_FINAL, "NO_FINDINGS")
-        self.write(ROUND_COMPLETE)
-
-        def finish_promotion(_: float) -> None:
-            (self.coordination_directory / REVIEWER_FINAL).unlink()
-
-        reviewer_loop.wait_for_request(
-            self.coordination_directory,
-            participated=True,
-            poll_interval=0.01,
-            stale_grace=1,
-            sleep_fn=finish_promotion,
-        )
-
-    def test_participating_reviewer_cleans_orphaned_response_temp(self) -> None:
+    def test_reviewer_cleans_orphaned_response_temp(self) -> None:
         reviewer_temp = self.write(REVIEWER_TEMP, "partial")
         self.write(IMPLEMENTOR_FINAL, "context")
 
         with mock.patch.object(reviewer_loop, "emit") as emit_mock:
-
-            def finish_wait(_: float) -> None:
-                if not reviewer_temp.exists():
-                    self.write(REVIEW_LOCK)
-
-            reviewer_loop.wait_for_request(
-                self.coordination_directory,
-                participated=True,
-                poll_interval=0.01,
-                sleep_fn=finish_wait,
-            )
+            reviewer_loop.read_request(self.coordination_directory)
 
         self.assertFalse(reviewer_temp.exists())
-        self.assertEqual(emit_mock.call_args.kwargs["event"], "review_request")
+        self.assertEqual(emit_mock.call_args.kwargs["event"], "no_request")
 
-    def test_reviewer_wait_recovers_a_published_response_without_repeating_it(
+    def test_reviewer_read_recovers_a_published_response_without_repeating_it(
         self,
     ) -> None:
         self.write(IMPLEMENTOR_FINAL, "context")
@@ -435,11 +348,7 @@ class ReviewLoopScriptTests(unittest.TestCase):
         reviewer_final = self.write(REVIEWER_FINAL, "NO_FINDINGS")
 
         with mock.patch.object(reviewer_loop, "emit") as emit_mock:
-            reviewer_loop.wait_for_request(
-                self.coordination_directory,
-                participated=False,
-                poll_interval=0.01,
-            )
+            reviewer_loop.read_request(self.coordination_directory)
 
         self.assertEqual(emit_mock.call_args.kwargs["event"], "review_ready_to_release")
         self.assertEqual(reviewer_final.read_text(encoding="utf-8"), "NO_FINDINGS")
@@ -632,100 +541,6 @@ class ReviewLoopScriptTests(unittest.TestCase):
 
         implementor_loop.acknowledge_feedback(self.coordination_directory)
 
-    def test_completion_requires_exact_no_findings_and_cleans_first(self) -> None:
-        self.write(IMPLEMENTOR_FINAL, "context")
-        self.write(REVIEWER_FINAL, "NO_FINDINGS\n")
-
-        implementor_loop.complete(self.coordination_directory)
-
-        self.assertEqual(
-            snapshot(self.coordination_directory).present_names(), [ROUND_COMPLETE]
-        )
-
-    def test_completion_atomically_promotes_the_clean_response_last(self) -> None:
-        self.write(IMPLEMENTOR_FINAL, "context")
-        reviewer_final = self.write(REVIEWER_FINAL, "NO_FINDINGS")
-        real_replace = implementor_loop.os.replace
-
-        def assert_ready_then_replace(source: str, destination: str) -> None:
-            state = snapshot(self.coordination_directory)
-            self.assertEqual(state.present_names(), [REVIEWER_FINAL])
-            self.assertEqual(reviewer_final.read_bytes(), b"")
-            real_replace(source, destination)
-
-        with mock.patch.object(
-            implementor_loop.os, "replace", side_effect=assert_ready_then_replace
-        ):
-            implementor_loop.complete(self.coordination_directory)
-
-        self.assertEqual(
-            snapshot(self.coordination_directory).present_names(), [ROUND_COMPLETE]
-        )
-
-    def test_completion_recovers_after_interruption_before_atomic_promotion(
-        self,
-    ) -> None:
-        reviewer_final = self.write(REVIEWER_FINAL, "NO_FINDINGS")
-        with (
-            mock.patch.object(
-                implementor_loop.os,
-                "replace",
-                side_effect=OSError("simulated interruption"),
-            ),
-            self.assertRaisesRegex(ProtocolError, "cannot publish"),
-        ):
-            implementor_loop.complete(self.coordination_directory)
-
-        self.assertEqual(reviewer_final.read_bytes(), b"")
-        implementor_loop.complete(self.coordination_directory)
-        self.assertEqual(
-            snapshot(self.coordination_directory).present_names(), [ROUND_COMPLETE]
-        )
-
-    def test_completion_replay_accepts_an_existing_marker(self) -> None:
-        self.write(ROUND_COMPLETE)
-
-        implementor_loop.complete(self.coordination_directory)
-
-    def test_completion_replay_accepts_an_already_acknowledged_state(self) -> None:
-        implementor_loop.complete(self.coordination_directory)
-
-    def test_completion_rejects_findings(self) -> None:
-        self.write(IMPLEMENTOR_FINAL, "context")
-        self.write(REVIEWER_FINAL, "finding")
-
-        with self.assertRaises(ProtocolError):
-            implementor_loop.complete(self.coordination_directory)
-
-    def test_completion_wait_blocks_until_acknowledged(self) -> None:
-        marker = self.write(ROUND_COMPLETE)
-        call = BackgroundCall(
-            lambda: implementor_loop.wait_for_completion(
-                self.coordination_directory, poll_interval=0.01
-            )
-        )
-
-        time.sleep(0.04)
-        call.assert_running(self)
-        marker.unlink()
-        call.join_cleanly(self)
-
-    def test_reviewer_acknowledges_completion_only_after_participation(self) -> None:
-        self.write(ROUND_COMPLETE)
-        with self.assertRaises(ProtocolError):
-            reviewer_loop.acknowledge_completion(
-                self.coordination_directory, participated=False
-            )
-
-        reviewer_loop.acknowledge_completion(
-            self.coordination_directory, participated=True
-        )
-        self.assertEqual(snapshot(self.coordination_directory).present_names(), [])
-
-        reviewer_loop.acknowledge_completion(
-            self.coordination_directory, participated=True
-        )
-
     def test_invalid_cli_arguments_emit_structured_error(self) -> None:
         process = self.start_cli("implementor_loop.py", "wait-for-review")
         stdout, stderr = process.communicate(timeout=2)
@@ -746,7 +561,7 @@ class ReviewLoopScriptTests(unittest.TestCase):
     def test_cleanup_refuses_a_directory_at_a_protocol_path(self) -> None:
         (self.coordination_directory / REVIEW_LOCK).mkdir()
         with self.assertRaises(ProtocolError):
-            implementor_loop.startup_cleanup(self.coordination_directory)
+            remove_exact(self.coordination_directory, PROTOCOL_FILES)
 
 
 if __name__ == "__main__":

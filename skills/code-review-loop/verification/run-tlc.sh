@@ -29,8 +29,17 @@ fi
 data_root=${XDG_DATA_HOME:-${HOME:?}/.local/share}
 default_tools_jar=$data_root/tlaplus/2026.08.11.125311-0894c34/tla2tools.jar
 pinned_tools_sha=ab323b79802aedc3203b3f9af37c6aca3ed43f4e0225b36f2aa77b26de46c05f
-metadata_dir=${TLC_METADIR:-${TMPDIR:-/tmp}/code-review-loop-tlc}
+# Isolate every invocation, including concurrent checks. Never write model state
+# or counterexample artifacts into a coordination directory or the source tree.
+if [ -n "${TLC_METADIR:-}" ]; then
+    metadata_dir=$TLC_METADIR
+else
+    metadata_dir=$(mktemp -d "${TMPDIR:-/tmp}/code-review-loop-tlc.XXXXXX")
+    trap 'rm -rf "$metadata_dir"' EXIT HUP INT TERM
+fi
+workers=${TLC_WORKERS:-1}
 config_name=${TLC_CONFIG:-CodeReviewLoop.cfg}
+model_path=${TLC_MODEL:-$verification_dir/CodeReviewLoop.tla}
 
 if [ -n "${TLA2TOOLS_JAR:-}" ]; then
     tools_jar=$TLA2TOOLS_JAR
@@ -48,6 +57,11 @@ esac
 if [ ! -f "$tools_jar" ]; then
     echo "TLA+ tools not found at $tools_jar" >&2
     echo "Set TLA2TOOLS_JAR to a tla2tools.jar location." >&2
+    exit 1
+fi
+
+if [ ! -f "$model_path" ]; then
+    echo "TLA+ model not found at $model_path" >&2
     exit 1
 fi
 
@@ -89,14 +103,14 @@ case ${TLC_COVERAGE:-0} in
         ;;
 esac
 
-exec "$java_bin" \
+"$java_bin" \
     -XX:+UseParallelGC \
     -cp "$tools_jar" \
     tlc2.TLC \
     -cleanup \
     -noGenerateSpecTE \
     "$@" \
-    -workers auto \
+    -workers "$workers" \
     -metadir "$metadata_dir" \
     -config "$config_path" \
-    "$verification_dir/CodeReviewLoop.tla"
+    "$model_path"

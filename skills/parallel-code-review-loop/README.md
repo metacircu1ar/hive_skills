@@ -1,63 +1,41 @@
 # Parallel code-review loop example
 
-This is a human-facing example of the workflow defined by [SKILL.md](SKILL.md). `SKILL.md` is the normative contract if this example and the skill ever disagree.
+The [skill](SKILL.md) runs one dispatcher and N implementor/reviewer conversations.
+All participants use one coordination directory, even when their source paths differ.
 
-## Scenario: one workspace, N repositories
+## One workspace, N repositories
 
-Suppose one workspace contains shared epic context and three independent repositories:
+For example, `/workspace` contains shared context and the supplied repositories:
 
 ```text
 /workspace/
-├── context/
-│   └── EPIC.md
-├── accounts-repo/
-│   └── TASK.md
-├── billing-repo/
-│   └── TASK.md
-└── notifications-repo/
-    └── TASK.md
+  EPIC.md
+  accounts-repo/TASK.md
+  billing-repo/TASK.md
+  notifications-repo/TASK.md
+  .hive_skills_reviews/        # managed exclusively by the base skill's scripts
+    sessions/<session-id>/
 ```
 
-Here `N = 3`. The orchestrator creates one dedicated pair for each repository. Assignment IDs remain stable report data; the orchestrator derives separate provider-valid launch names for the agents:
-
-| Assignment | Baseline implementor name | Baseline reviewer name | Repository and coordination directory |
-|---|---|---|---|
-| `accounts` | `pair_001_implementor` | `pair_001_reviewer` | `/workspace/accounts-repo` |
-| `billing` | `pair_002_implementor` | `pair_002_reviewer` | `/workspace/billing-repo` |
-| `notifications` | `pair_003_implementor` | `pair_003_reviewer` | `/workspace/notifications-repo` |
-
-Each pair is independent. Its repository root is also its `code-review-loop` coordination directory, so temporary `.hive_skills_*` protocol files appear only in that repository. They are removed after clean completion.
-
-With six confirmed worker slots available in addition to the orchestrator, all three pairs can run concurrently. With only four, the orchestrator runs at most two complete pairs at once and queues the remaining pair. It never starts implementors without reserving capacity for their reviewers. If it cannot confirm at least two slots, live progress-message delivery, monitoring, and cancellation, preflight stops without launching a pair.
-
-Within every pair, startup is ordered:
-
-```text
-implementor starts
-  -> implementor completes startup cleanup
-  -> orchestrator receives a structured startup_clean event
-  -> reviewer starts
-  -> pair follows the code-review-loop protocol to completion
-  -> both roles send matching terminal_result events and exit
-```
+The orchestrator starts one dispatcher and three implementors. The dispatcher creates
+one reviewer worker per submitted session. By default, each round uses a fresh session
+and reviewer, then closes that session. With `session_mode: "reuse"`, the dispatcher
+resumes the same conversation for subsequent rounds. Workers finish each turn and
+make no idle wait calls.
 
 ## Example input file
 
-Save a manifest such as `/workspace/parallel-review-input.json`:
+Save this as `/workspace/parallel-review-input.json`:
 
 ```json
 {
+  "coordination_dir": "/workspace",
+  "session_mode": "fresh",
   "general_context": {
-    "objective": "Complete the three tasks as one compatible epic.",
-    "sources": [
-      {
-        "path": "/workspace/context/EPIC.md",
-        "description": "Shared architecture, compatibility constraints, and integration expectations."
-      }
-    ],
-    "common_constraints": [
-      "Preserve existing public APIs unless a task explicitly changes one.",
-      "Leave implementation changes uncommitted for later integration."
+    "task_source": "/workspace/EPIC.md",
+    "constraints": [
+      "Preserve public APIs unless a task explicitly changes them.",
+      "Leave implementation changes uncommitted."
     ]
   },
   "assignments": [
@@ -65,61 +43,79 @@ Save a manifest such as `/workspace/parallel-review-input.json`:
       "id": "accounts",
       "working_path": "/workspace/accounts-repo",
       "agent_context": {
-        "objective": "Implement the account-lockout task.",
         "task_source": "/workspace/accounts-repo/TASK.md",
-        "validation": "Run the repository's documented account test suite.",
-        "required_output": "Working code, tests, and a completed review loop."
+        "validation": "Run the account test suite."
       }
     },
     {
       "id": "billing",
       "working_path": "/workspace/billing-repo",
       "agent_context": {
-        "objective": "Implement the invoice-retry task.",
         "task_source": "/workspace/billing-repo/TASK.md",
-        "validation": "Run the repository's documented billing test suite.",
-        "required_output": "Working code, tests, and a completed review loop."
+        "validation": "Run the billing test suite."
       }
     },
     {
       "id": "notifications",
       "working_path": "/workspace/notifications-repo",
       "agent_context": {
-        "objective": "Implement the delivery-deduplication task.",
         "task_source": "/workspace/notifications-repo/TASK.md",
-        "validation": "Run the repository's documented notification test suite.",
-        "required_output": "Working code, tests, and a completed review loop."
+        "validation": "Run the notification test suite."
       }
     }
-  ],
-  "max_parallel_pairs": 3
+  ]
 }
 ```
 
-Add or remove assignment entries to obtain arbitrary `N`. Every `working_path` must be an absolute, disjoint repository root: equal and nested roots are rejected. `max_parallel_pairs` is optional and, when present, must be a positive integer. The effective limit is the minimum of `N`, that value, and half the confirmed worker slots.
+Add or remove assignments to obtain N. Repository arrangement is the caller's concern;
+the wrapper checks each supplied directory but does not compare source paths across pairs.
 
-After confirming six concurrently available worker slots, the orchestrator runs the deterministic preflight check:
+Validate and invoke:
 
 ```text
-python3 "/installed/parallel-code-review-loop/scripts/validate_input.py" "/workspace/parallel-review-input.json" --confirmed-worker-slots 6
+python3 "/installed/parallel-code-review-loop/scripts/validate_input.py" "/workspace/parallel-review-input.json"
+/parallel-code-review-loop /workspace/parallel-review-input.json
 ```
 
-The command prints canonical roots, collision-safe baseline launch names, effective concurrency, and whether waves are required. The orchestrator verifies those names against its provider and adapts them if necessary. YAML manifests are also accepted when PyYAML is installed; JSON needs only Python's standard library.
+There is no capacity argument or pair-limit field. The runtime must support asynchronous
+agent creation, completion notifications, conversation resume, and stopping; an actual
+launch failure is reported. The base skill describes background waiting and host limits.
 
-## What each role receives
+## What happens
 
-Every implementor receives the shared `general_context`, its own `agent_context`, its assignment ID, and its repository path. Its first protocol message gives its reviewer the complete repository, task, evidence, and review-target context.
+1. Each implementor receives general context, its task context, repository path, and
+   the common coordination directory.
+2. It opens a session through the base script and reports each new ID to the wrapper.
+3. It implements, tests, and submits a complete review handoff through that session.
+4. The dispatcher launches a static reviewer, which publishes and ends its turn.
+5. In fresh mode, the implementor reads the result and closes the session, even when
+   there are findings. After fixes and checks, another round opens a new session with
+   a complete handoff. In reuse mode, the same session stays open and the dispatcher
+   resumes its reviewer; closure follows the final clean round.
+6. After clean review, checks, and closure, the implementor reports its terminal result.
+   The wrapper verifies that result and closure of every recorded session. It shuts
+   down its own dispatcher after all assignments finish.
 
-Each reviewer starts with only its assignment ID, repository path, reviewer role, and the base `code-review-loop` skill location. It obtains task context from the implementor's protocol message, keeping that message as the single source of truth.
+The wrapper never waits for reviewer terminal messages or for channel files to disappear.
+On failure, it requests closure through the helper instead of cancelling a reviewer itself.
+Every role uses the supplied scripts to interact with coordination files and is silent
+while waiting.
 
-The orchestrator waits until all pairs finish or fail, then reports each assignment separately. If one role fails, it cancels the surviving role through the runtime and leaves that repository and its protocol files untouched for diagnosis. It does not merge or otherwise integrate the repositories unless that is requested as a separate operation.
+An operator can say `revive` to the dispatcher to restore all open conversations,
+including idle ones. Idle conversations remain dormant until a request arrives. A
+normal start after clean service shutdown performs the same recovery. Replacements
+for unavailable runtime conversations with pending work are reported.
 
 ## Maintainer checks
 
-Run the deterministic preflight tests with:
-
 ```text
-PYTHONDONTWRITEBYTECODE=1 python3 "<skill-dir>/scripts/test_validate_input.py" -v
+python3 "<skill-dir>/scripts/test_validate_input.py"
+python3 -m unittest discover -s "<base-skill-dir>/scripts" -p 'test_*.py'
 ```
 
-These tests cover manifest structure, capacity arithmetic, path isolation, and launch-name derivation. They do not simulate an agent provider or prove live message delivery, cancellation, role compliance, or process liveness; those remain runtime preflight requirements and should be exercised end to end when the supported runtime changes.
+Input tests check context, paths, and assignment identity. Base-script process tests
+exercise routing, continuation, closure, and recovery decisions. The base skill's
+[bounded TLA+ suite](../code-review-loop/verification/README.md) checks session and
+dispatcher behavior; run its `verification/check-all.sh` when changing that protocol.
+An actual agent exercise is still needed to check that agents follow the lifecycle
+instructions.

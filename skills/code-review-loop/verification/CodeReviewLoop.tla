@@ -1,1083 +1,459 @@
 --------------------------- MODULE CodeReviewLoop ---------------------------
-EXTENDS Naturals, TLC
+EXTENDS Naturals, FiniteSets, TLC
 
 (***************************************************************************
-WHY
-  The review protocol has two concurrent actors and six file-backed signals in
-  one fixed abstract coordination namespace.
-  TLC explores whether compliant action interleavings preserve snapshot,
-  publication, decision, cleanup, and shutdown guarantees.
+On-demand reviewer turns, session channels, and one shared dispatcher.
 
-WHAT
-  This module models arbitrary stale-file startup cleanup, an externally
-  launched passive reviewer, mandatory implementor context on every request,
-  reviewer findings or NO_FINDINGS, atomic channel publication, another
-  planned implementation phase, shutdown through the implementor protocol
-  endpoint, and one budgeted lock loss. Whether the implementor or its caller
-  owns the shutdown decision is control policy outside this file-state model.
+This is a bounded behavioral abstraction, NOT a refinement proof of Python or
+of the runtime. Each session has one compliant implementor and at most one
+executing worker. Helpers' check/act sequences are atomic at the boundaries
+below; context temp creation, context promotion, dispatch queuing, request creation, response
+temp creation, response promotion, release, consumption, and acknowledgement
+are separate actions. Workers finish after each round. Runtime status
+is truthful and stable until the corresponding modeled operation completes.
 
-  The six top-level variables use records for file, content, request, and
-  fault state. Every action specifies each top-level next state, so TLC rejects
-  incomplete successors. Concrete paths and the reviewer's static-only
-  inspection behavior are outside the state-machine abstraction. The Python
-  role scripts implement waits as silent one-second polls. A poll that only
-  observes unchanged state is a stuttering step and is not represented
-  separately; missing-lock recovery maps to RetryMissingRequest, and a ready
-  result enables the corresponding actor transition.
+Launch + bind is one external-success action. A real bind failure must stop
+that unrecorded worker before dispatch continues; interruption in that window
+is outside this model. The dispatcher is unique: its marker is bookkeeping,
+not a lease. OperatorRevive represents explicit operator intervention after
+stopping the old dispatcher/waiter. It is deliberately NOT fair.
 
-HOW TO RUN
-  From this directory:
-
-      ./run-tlc.sh
-      ./check-state-space.sh
-      ./check-early-unlock.sh
-      ./check-temp-file-unlock.sh
-      ./check-cleanup-order.sh
-
-  The runner requires Java 11+ and tla2tools.jar. Override discovery with:
-
-      JAVA_BIN=/path/to/java \
-      TLA2TOOLS_JAR=/path/to/tla2tools.jar \
-      TLA2TOOLS_SHA256=expected-digest \
-      ./run-tlc.sh
-
-  TLC must finish with "Model checking completed. No error has been found."
-  Run statistics and tool provenance are recorded in the adjacent README.
-
-EnableLockLoss permits at most one environmental deletion of a current review
-lock, before acquisition or while a reviewer is active but has not decided.
-EnableEarlyUnlock and EnableTempFileEarlyUnlock add invalid reviewer unlocks.
-EnableEarlyCompletionPublication publishes completion before cleanup finishes.
+The finite Sessions set starts with fresh open channels. Opening them earlier
+or later than service startup is immaterial to the modeled decisions. Round,
+accepted, decisions, and payload tags are specification bookkeeping, NOT new
+runtime fields. Interruption/shutdown history serves only reachability witnesses.
+No source trees, textual findings, wall-clock polling, stale
+lock deletion, arbitrary file corruption, or wrapper terminal messages are
+modeled. See README.md for the complete boundary and checked configurations.
 ***************************************************************************)
 
-CONSTANTS
-    EnableLockLoss,
-    EnableEarlyUnlock,
-    EnableTempFileEarlyUnlock,
-    EnableEarlyCompletionPublication
+CONSTANTS Sessions, MaxRounds, MaxHandles, FaultBudget,
+          EnableServiceLifecycle, Mutation
+ASSUME /\ Sessions # {}
+       /\ MaxRounds \in Nat \ {0}
+       /\ MaxHandles \in Nat \ {0}
+       /\ FaultBudget \in Nat
+       /\ EnableServiceLifecycle \in BOOLEAN
+       /\ Mutation \in {"none", "earlyUnlock", "tempUnlock", "crossSession",
+                       "closeBeforeStop", "dropFeedback", "replaceRunning",
+                       "shutdownCloses"}
 
-ImplStates == {
-    "starting",
-    "editing",
-    "readyToMessage",
-    "writingMessage",
-    "messagePublished",
-    "acknowledging",
-    "ready",
-    "waiting",
-    "handling",
-    "cleaning",
-    "awaitingShutdownAck",
-    "done"
-}
+Kinds == {"none", "findings", "clean"}
+RuntimeStatuses == {"running", "resumable", "stopped", "gone", "unknown", "error"}
+Commands == {"none", "launch", "replace", "resume", "stop"}
 
-ReviewerStates == {
-    "offline",
-    "pollingFresh",
-    "pollingParticipated",
-    "reviewing",
-    "publishingFeedback",
-    "releasing",
-    "done"
-}
+VARIABLES q, service, faults
+vars == <<q, service, faults>>
 
-FileStates == [
-    reviewLock : BOOLEAN,
-    reviewerToImplementorTmp : BOOLEAN,
-    reviewerToImplementorTxt : BOOLEAN,
-    implementorToReviewerTmp : BOOLEAN,
-    implementorToReviewerTxt : BOOLEAN,
-    roundComplete : BOOLEAN
-]
-
-ContentStates == [
-    code : BOOLEAN,
-    submittedCode : BOOLEAN,
-    reviewedCode : BOOLEAN,
-    reviewerMessage : BOOLEAN,
-    implementorMessage : BOOLEAN,
-    submittedImplementorMessage : BOOLEAN
-]
-
-FeedbackKinds == {"none", "findings", "noFindings"}
-ReviewerFeedbackKinds == {"findings", "noFindings"}
-
-RequestStates == [
-    active : BOOLEAN,
-    decisionCount : 0..1,
-    submittedImplementorMessagePresent : BOOLEAN,
-    feedbackKind : FeedbackKinds
-]
-
-FaultStates == [lockLossAvailable : BOOLEAN]
-
-VARIABLES
-    impl,
-    reviewer,
-    files,
-    content,
-    request,
-    faults
-
-vars == <<
-    impl,
-    reviewer,
-    files,
-    content,
-    request,
-    faults
->>
-
-FilesExceptCompletionAbsent ==
-    /\ ~files.reviewLock
-    /\ ~files.reviewerToImplementorTmp
-    /\ ~files.reviewerToImplementorTxt
-    /\ ~files.implementorToReviewerTmp
-    /\ ~files.implementorToReviewerTxt
-
-AllFilesAbsent ==
-    /\ FilesExceptCompletionAbsent
-    /\ ~files.roundComplete
-
-ReviewerActive ==
-    reviewer \in {"reviewing", "publishingFeedback", "releasing"}
-
-ReviewerPolling ==
-    reviewer \in {"pollingFresh", "pollingParticipated"}
-
-ProtocolStarted == impl # "starting"
+EmptySession(s) ==
+    [closed |-> FALSE, close |-> FALSE, handle |-> 0,
+     runtime |-> "gone", command |-> "none", error |-> "none",
+     phase |-> "idle", round |-> 0, accepted |-> 0,
+     context |-> 0, contextTemp |-> FALSE, lock |-> FALSE,
+     dispatch |-> FALSE, deferred |-> FALSE,
+     responseTemp |-> "none", response |-> "none",
+     responseOwner |-> s, responseRound |-> 0, decisions |-> 0,
+     workerPC |-> "wait", reviewedRound |-> 0, interruptedAt |-> "none"]
 
 Init ==
-    /\ impl = "starting"
-    /\ reviewer = "offline"
-    /\ files \in FileStates
-    /\ content = [
-        code |-> FALSE,
-        submittedCode |-> FALSE,
-        reviewedCode |-> FALSE,
-        reviewerMessage |-> FALSE,
-        implementorMessage |-> FALSE,
-        submittedImplementorMessage |-> FALSE
-        ]
-    /\ request = [
-        active |-> FALSE,
-        decisionCount |-> 0,
-        submittedImplementorMessagePresent |-> FALSE,
-        feedbackKind |-> "none"
-        ]
-    /\ faults = [lockLossAvailable |-> EnableLockLoss]
+    /\ q = [s \in Sessions |-> EmptySession(s)]
+    /\ service = [mode |-> "off", recover |-> {}, stoppedOnce |-> FALSE, restarted |-> FALSE,
+                   idleShutdownHandle |-> [s \in Sessions |-> 0]]
+    /\ faults = FaultBudget
 
-\* Startup removes one stale file at a time. The completion marker is removed
-\* only after every other working file is absent.
-StartupCleanupStep ==
-    /\ impl = "starting"
-    /\ \/
-        /\ files.reviewLock
-        /\ files' = [files EXCEPT !.reviewLock = FALSE]
-       \/ /\
-            files.reviewerToImplementorTmp
-          /\ files' = [
-              files EXCEPT !.reviewerToImplementorTmp = FALSE
-              ]
-       \/ /\
-            files.reviewerToImplementorTxt
-          /\ files' = [
-              files EXCEPT !.reviewerToImplementorTxt = FALSE
-              ]
-       \/ /\
-            files.implementorToReviewerTmp
-          /\ files' = [
-              files EXCEPT !.implementorToReviewerTmp = FALSE
-              ]
-       \/ /\
-            files.implementorToReviewerTxt
-          /\ files' = [
-              files EXCEPT !.implementorToReviewerTxt = FALSE
-              ]
-       \/ /\
-            files.roundComplete
-          /\ FilesExceptCompletionAbsent
-          /\ files' = [files EXCEPT !.roundComplete = FALSE]
-    /\ UNCHANGED <<
-        impl,
-        reviewer,
-        content,
-        request,
-        faults
-        >>
+Open(s) == ~q[s].closed /\ ~q[s].close
+Bound(s) == q[s].handle # 0
+Live(s) == q[s].runtime = "running"
+WorkerCanRun(s) == Bound(s) /\ q[s].runtime = "running"
 
-FinishStartupCleanup ==
-    /\ impl = "starting"
-    /\ AllFilesAbsent
-    /\ impl' = "editing"
-    /\ UNCHANGED <<
-        reviewer,
-        files,
-        content,
-        request,
-        faults
-        >>
+\* Literal branch ordering of dispatcher_loop.decide_action.
+Decide(x, observed, shuttingDown) ==
+    IF x.closed THEN "leave"
+    ELSE IF observed = "error" THEN "report"
+    ELSE IF x.close \/ shuttingDown THEN
+        IF x.handle = 0 \/ observed \in {"stopped", "gone", "unknown"}
+        THEN IF x.close THEN "mark_closed" ELSE "leave"
+        ELSE "stop"
+    ELSE IF ~x.lock THEN "leave"
+    ELSE IF x.handle = 0 THEN "launch"
+    ELSE IF observed = "running" THEN IF x.dispatch THEN "await_worker" ELSE "continue"
+    ELSE IF observed = "resumable" THEN "resume"
+    ELSE "replace"
 
-\* This transition represents the external caller launching the passive
-\* reviewer only after the implementor reports startup cleanup complete.
-StartReviewer ==
-    /\ reviewer = "offline"
-    /\ ProtocolStarted
-    /\ reviewer' = "pollingFresh"
-    /\ UNCHANGED <<
-        impl,
-        files,
-        content,
-        request,
-        faults
-        >>
+\* Unknown is an explicit unknown-handle answer, never a runtime-call error.
+Observations(s) ==
+    IF ~Bound(s) THEN {"gone"}
+    ELSE IF q[s].runtime = "gone" THEN {"gone", "unknown"}
+    ELSE IF q[s].runtime = "resumable" /\ (q[s].close \/ service.mode = "shutdown")
+         THEN {"stopped"}
+    ELSE {q[s].runtime}
 
-FinishImplementationPhase ==
-    /\ impl = "editing"
-    /\ ~files.reviewLock
-    /\ ~files.reviewerToImplementorTmp
-    /\ ~files.reviewerToImplementorTxt
-    /\ ~files.implementorToReviewerTmp
-    /\ ~files.roundComplete
-    /\ impl' = "readyToMessage"
-    /\ \E newCode \in BOOLEAN:
-        content' = [content EXCEPT !.code = newCode]
-    /\ UNCHANGED <<
-        reviewer,
-        files,
-        request,
-        faults
-        >>
+ListenerEvent(s) ==
+    /\ ~q[s].closed
+    /\ IF q[s].close THEN q[s].error # "close"
+       ELSE q[s].dispatch /\ ~q[s].deferred /\ q[s].error = "none" /\ q[s].lock
 
-ClearImplementorMessage ==
-    /\ impl = "readyToMessage"
-    /\ ~files.reviewLock
-    /\ ~files.roundComplete
-    /\ ~files.implementorToReviewerTmp
-    /\ files.implementorToReviewerTxt
-    /\ files' = [
-        files EXCEPT !.implementorToReviewerTxt = FALSE
-        ]
-    /\ UNCHANGED <<
-        impl,
-        reviewer,
-        content,
-        request,
-        faults
-        >>
+NeedsDispatch(s) ==
+    /\ q[s].command = "none"
+    /\ service.mode \in {"running", "shutdown"}
+    /\ s \in service.recover \/
+       (service.mode = "running" /\ ListenerEvent(s))
 
-\* A later request may reuse the complete published context unchanged. The
-\* inbound reviewer final is acknowledged separately.
-ReuseImplementorMessage ==
-    /\ impl = "readyToMessage"
-    /\ ~files.reviewLock
-    /\ ~files.roundComplete
-    /\ ~files.reviewerToImplementorTmp
-    /\ ~files.implementorToReviewerTmp
-    /\ files.implementorToReviewerTxt
-    /\ impl' = "acknowledging"
-    /\ UNCHANGED <<
-        reviewer,
-        files,
-        content,
-        request,
-        faults
-        >>
+PrepareContext(s) ==
+    /\ Open(s) /\ q[s].phase = "idle" /\ q[s].round < MaxRounds
+    /\ ~q[s].lock /\ q[s].response = "none"
+    /\ q[s].responseTemp = "none"
+    /\ q' = [q EXCEPT ![s].phase = "contextTemp",
+                     ![s].round = @ + 1, ![s].context = 0,
+                     ![s].contextTemp = TRUE, ![s].decisions = 0,
+                     ![s].dispatch = FALSE]
+    /\ UNCHANGED <<service, faults>>
 
-StartImplementorMessage ==
-    /\ impl = "readyToMessage"
-    /\ ~files.reviewLock
-    /\ ~files.roundComplete
-    /\ ~files.reviewerToImplementorTmp
-    /\ ~files.implementorToReviewerTmp
-    /\ ~files.implementorToReviewerTxt
-    /\ impl' = "writingMessage"
-    /\ files' = [files EXCEPT !.implementorToReviewerTmp = TRUE]
-    /\ UNCHANGED <<
-        reviewer,
-        content,
-        request,
-        faults
-        >>
+\* A restarted publish-context removes its unfinished temp and republishes.
+\* Rewriting the same abstract complete body is a stutter at this boundary.
+PromoteContext(s) ==
+    /\ Open(s) /\ q[s].phase = "contextTemp"
+    /\ q[s].contextTemp /\ ~q[s].lock
+    /\ q' = [q EXCEPT ![s].contextTemp = FALSE,
+                     ![s].context = q[s].round, ![s].phase = "ready"]
+    /\ UNCHANGED <<service, faults>>
 
-PublishImplementorMessage ==
-    /\ impl = "writingMessage"
-    /\ ~files.reviewLock
-    /\ ~files.roundComplete
-    /\ files.implementorToReviewerTmp
-    /\ ~files.implementorToReviewerTxt
-    /\ impl' = "messagePublished"
-    /\ files' = [
-        files EXCEPT
-            !.implementorToReviewerTmp = FALSE,
-            !.implementorToReviewerTxt = TRUE
-        ]
-    /\ \E newMessage \in BOOLEAN:
-        content' = [content EXCEPT !.implementorMessage = newMessage]
-    /\ UNCHANGED <<
-        reviewer,
-        request,
-        faults
-        >>
+QueueDispatch(s) ==
+    /\ Open(s) /\ q[s].phase = "ready" /\ ~q[s].lock /\ ~q[s].dispatch
+    /\ q' = [q EXCEPT ![s].dispatch = TRUE]
+    /\ UNCHANGED <<service, faults>>
 
-FinishImplementorMessage ==
-    /\ impl = "messagePublished"
-    /\ ~files.reviewLock
-    /\ ~files.reviewerToImplementorTmp
-    /\ ~files.implementorToReviewerTmp
-    /\ files.implementorToReviewerTxt
-    /\ impl' = "acknowledging"
-    /\ UNCHANGED <<
-        reviewer,
-        files,
-        content,
-        request,
-        faults
-        >>
+RequestReview(s) ==
+    /\ Open(s) /\ q[s].phase = "ready"
+    /\ q[s].context = q[s].round /\ ~q[s].contextTemp
+    /\ ~q[s].lock /\ q[s].response = "none" /\ q[s].dispatch
+    /\ q' = [q EXCEPT ![s].lock = TRUE, ![s].phase = "waiting"]
+    /\ UNCHANGED <<service, faults>>
 
-FinishInitialPreparation ==
-    /\ impl = "acknowledging"
-    /\ ~request.active
-    /\ ~files.reviewerToImplementorTxt
-    /\ impl' = "ready"
-    /\ UNCHANGED <<
-        reviewer,
-        files,
-        content,
-        request,
-        faults
-        >>
+ReadRequest(s) ==
+    /\ Open(s) /\ WorkerCanRun(s) /\ q[s].workerPC = "wait"
+    /\ q[s].lock /\ q[s].response = "none"
+    /\ q' = [q EXCEPT ![s].workerPC = "review",
+                     ![s].reviewedRound = q[s].context]
+    /\ UNCHANGED <<service, faults>>
 
-AcknowledgeReviewerMessage ==
-    /\ impl = "acknowledging"
-    /\ request.active
-    /\ request.decisionCount = 1
-    /\ ~files.reviewLock
-    /\ ~files.roundComplete
-    /\ ~files.reviewerToImplementorTmp
-    /\ files.reviewerToImplementorTxt
-    /\ impl' = IF request.feedbackKind = "noFindings"
-        THEN "editing"
-        ELSE "readyToMessage"
-    /\ files' = [files EXCEPT !.reviewerToImplementorTxt = FALSE]
-    /\ request' = [
-        request EXCEPT
-            !.active = FALSE,
-            !.decisionCount = 0,
-            !.feedbackKind = "none"
-        ]
-    /\ UNCHANGED <<
-        reviewer,
-        content,
-        faults
-        >>
+WriteResponseTemp(s) ==
+    /\ Open(s) /\ WorkerCanRun(s) /\ q[s].workerPC = "review"
+    /\ q[s].lock /\ q[s].response = "none"
+    /\ \E kind \in Kinds \ {"none"}:
+         q' = [q EXCEPT ![s].responseTemp = kind, ![s].workerPC = "promote"]
+    /\ UNCHANGED <<service, faults>>
 
-RequestReview ==
-    /\ impl = "ready"
-    /\ ~files.reviewLock
-    /\ ~files.roundComplete
-    /\ ~files.reviewerToImplementorTmp
-    /\ ~files.reviewerToImplementorTxt
-    /\ ~files.implementorToReviewerTmp
-    /\ files.implementorToReviewerTxt
-    /\ impl' = "waiting"
-    /\ files' = [files EXCEPT !.reviewLock = TRUE]
-    /\ content' = [
-        content EXCEPT
-            !.submittedCode = content.code,
-            !.submittedImplementorMessage = content.implementorMessage
-        ]
-    /\ request' = [
-        request EXCEPT
-            !.active = TRUE,
-            !.decisionCount = 0,
-            !.submittedImplementorMessagePresent =
-                files.implementorToReviewerTxt,
-            !.feedbackKind = "none"
-        ]
-    /\ UNCHANGED <<
-        reviewer,
-        faults
-        >>
+PromoteResponse(s) ==
+    /\ Open(s) /\ WorkerCanRun(s) /\ q[s].workerPC = "promote"
+    /\ q[s].lock /\ q[s].responseTemp # "none" /\ q[s].response = "none"
+    /\ q' = [q EXCEPT ![s].response = q[s].responseTemp,
+                     ![s].responseTemp = "none", ![s].responseOwner = s,
+                     ![s].responseRound = q[s].round,
+                     ![s].decisions = @ + 1, ![s].workerPC = "release"]
+    /\ UNCHANGED <<service, faults>>
 
-LosePollingLock ==
-    /\ EnableLockLoss
-    /\ faults.lockLossAvailable
-    /\ impl = "waiting"
-    /\ ReviewerPolling
-    /\ files.reviewLock
-    /\ request.active
-    /\ request.decisionCount = 0
-    /\ files' = [files EXCEPT !.reviewLock = FALSE]
-    /\ faults' = [faults EXCEPT !.lockLossAvailable = FALSE]
-    /\ UNCHANGED <<
-        impl,
-        reviewer,
-        content,
-        request
-        >>
+\* Any restored worker sees the final and releases it without reviewing again.
+RecoverPublishedResponse(s) ==
+    /\ Open(s) /\ WorkerCanRun(s) /\ q[s].workerPC = "wait"
+    /\ q[s].lock /\ q[s].response # "none"
+    /\ q' = [q EXCEPT ![s].workerPC = "release"]
+    /\ UNCHANGED <<service, faults>>
 
-\* A re-created marker is the same logical request. The submitted
-\* implementation and implementor message stay frozen across this gap.
-LoseActiveReviewLock ==
-    /\ EnableLockLoss
-    /\ faults.lockLossAvailable
-    /\ impl = "waiting"
-    /\ reviewer \in {"reviewing", "publishingFeedback"}
-    /\ files.reviewLock
-    /\ request.active
-    /\ request.decisionCount = 0
-    /\ files' = [files EXCEPT !.reviewLock = FALSE]
-    /\ faults' = [faults EXCEPT !.lockLossAvailable = FALSE]
-    /\ UNCHANGED <<
-        impl,
-        reviewer,
-        content,
-        request
-        >>
+ReleaseReview(s) ==
+    /\ Open(s) /\ WorkerCanRun(s) /\ q[s].workerPC = "release"
+    /\ q[s].lock /\ q[s].response # "none" /\ q[s].responseTemp = "none"
+    /\ q' = [q EXCEPT ![s].lock = FALSE, ![s].workerPC = "end"]
+    /\ UNCHANGED <<service, faults>>
 
-RetryMissingRequest ==
-    /\ impl = "waiting"
-    /\ request.active
-    /\ request.decisionCount = 0
-    /\ ~files.reviewLock
-    /\ ~files.roundComplete
-    /\ ~files.reviewerToImplementorTmp
-    /\ ~files.reviewerToImplementorTxt
-    /\ ~files.implementorToReviewerTmp
-    /\ files' = [files EXCEPT !.reviewLock = TRUE]
-    /\ UNCHANGED <<
-        impl,
-        reviewer,
-        content,
-        request,
-        faults
-        >>
+\* Completion notification removes the dispatcher's busy-session deferral.
+\* No model/API call is needed while the resulting conversation is idle.
+FinishTurn(s) ==
+    /\ WorkerCanRun(s) /\ q[s].workerPC = "end"
+    /\ q' = [q EXCEPT ![s].runtime = "resumable", ![s].deferred = FALSE]
+    /\ UNCHANGED <<service, faults>>
 
-\* Entering reviewing represents the mandatory read of the frozen implementor
-\* context before the review decision can be produced.
-BeginReview ==
-    /\ ReviewerPolling
-    /\ files.reviewLock
-    /\ files.implementorToReviewerTxt
-    /\ ~files.implementorToReviewerTmp
-    /\ ~files.reviewerToImplementorTmp
-    /\ ~files.reviewerToImplementorTxt
-    /\ ~files.roundComplete
-    /\ reviewer' = "reviewing"
-    /\ content' = [
-        content EXCEPT !.reviewedCode = content.submittedCode
-        ]
-    /\ UNCHANGED <<
-        impl,
-        files,
-        request,
-        faults
-        >>
+ConsumeResponse(s) ==
+    /\ Open(s) /\ q[s].phase = "waiting"
+    /\ ~q[s].lock /\ q[s].response # "none" /\ q[s].responseTemp = "none"
+    /\ q' = [q EXCEPT ![s].phase = "received", ![s].accepted = q[s].round]
+    /\ UNCHANGED <<service, faults>>
 
-AbortReviewAfterLockLoss ==
-    /\ reviewer \in {"reviewing", "publishingFeedback"}
-    /\ ~files.reviewLock
-    /\ reviewer' = "pollingParticipated"
-    /\ files' = [
-        files EXCEPT !.reviewerToImplementorTmp = FALSE
-        ]
-    /\ UNCHANGED <<
-        impl,
-        content,
-        request,
-        faults
-        >>
+Acknowledge(s) ==
+    /\ Open(s) /\ q[s].phase = "received" /\ ~q[s].lock
+    /\ q' = [q EXCEPT ![s].response = "none", ![s].phase = "idle"]
+    /\ UNCHANGED <<service, faults>>
 
-StartPublishingFeedback ==
-    /\ reviewer = "reviewing"
-    /\ files.reviewLock
-    /\ ~files.roundComplete
-    /\ ~files.reviewerToImplementorTmp
-    /\ ~files.reviewerToImplementorTxt
-    /\ reviewer' = "publishingFeedback"
-    /\ files' = [files EXCEPT !.reviewerToImplementorTmp = TRUE]
-    /\ UNCHANGED <<
-        impl,
-        content,
-        request,
-        faults
-        >>
+RequestClose(s) ==
+    /\ Open(s)
+    /\ q' = [q EXCEPT ![s].close = TRUE]
+    /\ UNCHANGED <<service, faults>>
 
-PublishFeedback ==
-    /\ reviewer = "publishingFeedback"
-    /\ files.reviewLock
-    /\ files.reviewerToImplementorTmp
-    /\ ~files.reviewerToImplementorTxt
-    /\ reviewer' = "releasing"
-    /\ files' = [
-        files EXCEPT
-            !.reviewerToImplementorTmp = FALSE,
-            !.reviewerToImplementorTxt = TRUE
-        ]
-    /\ \E newMessage \in BOOLEAN:
-        \E newKind \in ReviewerFeedbackKinds:
-            /\ content' = [
-                content EXCEPT !.reviewerMessage = newMessage
-                ]
-            /\ request' = [
-                request EXCEPT
-                    !.decisionCount = request.decisionCount + 1,
-                    !.feedbackKind = newKind
-                ]
-    /\ UNCHANGED <<
-        impl,
-        faults
-        >>
+\* Closure while waiting cancels the round. Neither files nor a clean response
+\* are deleted or manufactured. The frozen phase remains until close is confirmed.
+WorkerSeesClose(s) ==
+    /\ q[s].close /\ ~q[s].closed /\ q[s].runtime = "running"
+    /\ q' = [q EXCEPT ![s].runtime = "resumable", ![s].workerPC = "end",
+                     ![s].deferred = FALSE]
+    /\ UNCHANGED <<service, faults>>
 
-ReleaseFeedback ==
-    /\ reviewer = "releasing"
-    /\ files.reviewLock
-    /\ files.reviewerToImplementorTxt
-    /\ reviewer' = "pollingParticipated"
-    /\ files' = [files EXCEPT !.reviewLock = FALSE]
-    /\ UNCHANGED <<
-        impl,
-        content,
-        request,
-        faults
-        >>
+StartService ==
+    /\ service.mode = "off"
+    /\ service' = [service EXCEPT !.mode = "running",
+                        !.recover = {s \in Sessions : ~q[s].closed},
+                        !.restarted = service.stoppedOnce]
+    /\ q' = [s \in Sessions |-> [q[s] EXCEPT !.deferred = FALSE]]
+    /\ UNCHANGED faults
 
-EarlyUnlockBeforePublishing ==
-    /\ EnableEarlyUnlock
-    /\ reviewer = "reviewing"
-    /\ files.reviewLock
-    /\ ~files.reviewerToImplementorTmp
-    /\ ~files.reviewerToImplementorTxt
-    /\ reviewer' = "pollingParticipated"
-    /\ files' = [files EXCEPT !.reviewLock = FALSE]
-    /\ UNCHANGED <<
-        impl,
-        content,
-        request,
-        faults
-        >>
+\* Operator-triggered, including in an existing dispatcher conversation.
+OperatorRevive ==
+    /\ EnableServiceLifecycle
+    /\ service.mode \in {"running", "down"}
+    /\ \A s \in Sessions : q[s].command = "none"
+    /\ service' = [service EXCEPT !.mode = "running",
+                        !.recover = {s \in Sessions : ~q[s].closed}]
+    /\ q' = [s \in Sessions |-> [q[s] EXCEPT !.deferred = FALSE]]
+    /\ UNCHANGED faults
 
-EarlyUnlockWithFeedbackTemp ==
-    /\ EnableTempFileEarlyUnlock
-    /\ reviewer = "publishingFeedback"
-    /\ files.reviewLock
-    /\ files.reviewerToImplementorTmp
-    /\ ~files.reviewerToImplementorTxt
-    /\ reviewer' = "pollingParticipated"
-    /\ files' = [files EXCEPT !.reviewLock = FALSE]
-    /\ UNCHANGED <<
-        impl,
-        content,
-        request,
-        faults
-        >>
+Dispatch(s) ==
+    /\ NeedsDispatch(s)
+    /\ \E observed \in Observations(s):
+       LET action == Decide(q[s], observed, service.mode = "shutdown") IN
+       /\ q' = [q EXCEPT ![s].error = "none",
+                  ![s].closed = IF action = "mark_closed" THEN TRUE ELSE @,
+                  ![s].dispatch = IF action \in {"launch", "replace", "resume"} THEN FALSE ELSE @,
+                  ![s].deferred = action = "await_worker",
+                  ![s].command = IF action \in Commands THEN action ELSE "none"]
+       /\ service' = [service EXCEPT !.recover = @ \ {s}]
+    /\ UNCHANGED faults
 
-\* This transition is the implementor's mandatory full read before editing.
-ObserveReviewerFeedback ==
-    /\ impl = "waiting"
-    /\ request.active
-    /\ request.decisionCount = 1
-    /\ ~files.reviewLock
-    /\ files.reviewerToImplementorTxt
-    /\ ~files.roundComplete
-    /\ impl' = "handling"
-    /\ UNCHANGED <<
-        reviewer,
-        files,
-        content,
-        request,
-        faults
-        >>
+DispatchError(s) ==
+    /\ NeedsDispatch(s) /\ faults > 0
+    /\ q' = [q EXCEPT ![s].error = IF q[s].close THEN "close" ELSE "runtime"]
+    /\ service' = [service EXCEPT !.recover = @ \ {s}]
+    /\ faults' = faults - 1
 
-ApplyReviewerFeedback ==
-    /\ impl = "handling"
-    /\ ~files.reviewLock
-    /\ files.reviewerToImplementorTxt
-    /\ request.feedbackKind = "findings"
-    /\ impl' = "acknowledging"
-    /\ \E newCode \in BOOLEAN:
-        content' = [content EXCEPT !.code = newCode]
-    /\ UNCHANGED <<
-        reviewer,
-        files,
-        request,
-        faults
-        >>
+RuntimeLaunchBind(s) ==
+    /\ q[s].command \in {"launch", "replace"}
+    /\ service.mode \in {"running", "shutdown"}
+    /\ q[s].handle < MaxHandles /\ ~q[s].closed
+    /\ q' = [q EXCEPT ![s].handle = @ + 1, ![s].runtime = "running",
+                     ![s].command = "none", ![s].error = "none",
+                     ![s].workerPC = "wait"]
+    /\ UNCHANGED <<service, faults>>
 
-\* NO_FINDINGS closes only the submitted snapshot. Another planned phase may
-\* be implemented before the next request.
-ContinueAfterNoFindings ==
-    /\ impl = "handling"
-    /\ ~files.reviewLock
-    /\ files.reviewerToImplementorTxt
-    /\ request.feedbackKind = "noFindings"
-    /\ impl' = "acknowledging"
-    /\ UNCHANGED <<
-        reviewer,
-        files,
-        content,
-        request,
-        faults
-        >>
+RuntimeResume(s) ==
+    /\ q[s].command = "resume"
+    /\ q' = [q EXCEPT ![s].runtime = "running", ![s].command = "none",
+                     ![s].workerPC = "wait"]
+    /\ UNCHANGED <<service, faults>>
 
-BeginCompletionCleanup ==
-    /\ impl = "handling"
-    /\ ~files.reviewLock
-    /\ ~files.roundComplete
-    /\ files.reviewerToImplementorTxt
-    /\ request.active
-    /\ request.decisionCount = 1
-    /\ request.feedbackKind = "noFindings"
-    /\ impl' = "cleaning"
-    /\ UNCHANGED <<
-        reviewer,
-        files,
-        content,
-        request,
-        faults
-        >>
+RuntimeStop(s) ==
+    /\ q[s].command = "stop"
+    /\ q' = [q EXCEPT ![s].runtime = "stopped", ![s].command = "none",
+                     ![s].workerPC = "wait"]
+    /\ service' = [service EXCEPT !.recover = @ \cup {s}]
+    /\ UNCHANGED faults
 
-RemoveCleanupReviewerTmp ==
-    /\ impl = "cleaning"
-    /\ ~files.roundComplete
-    /\ files.reviewerToImplementorTmp
-    /\ files' = [
-        files EXCEPT !.reviewerToImplementorTmp = FALSE
-        ]
-    /\ UNCHANGED <<
-        impl,
-        reviewer,
-        content,
-        request,
-        faults
-        >>
+RuntimeFailure(s) ==
+    /\ q[s].command # "none" /\ faults > 0
+    /\ q' = [q EXCEPT ![s].command = "none",
+                     ![s].error = IF q[s].close THEN "close" ELSE "runtime"]
+    /\ faults' = faults - 1
+    /\ UNCHANGED service
 
-RemoveCleanupImplementorTmp ==
-    /\ impl = "cleaning"
-    /\ ~files.roundComplete
-    /\ files.implementorToReviewerTmp
-    /\ files' = [
-        files EXCEPT !.implementorToReviewerTmp = FALSE
-        ]
-    /\ UNCHANGED <<
-        impl,
-        reviewer,
-        content,
-        request,
-        faults
-        >>
+\* Silence is not a listener event for a bound session. Only explicit recovery
+\* or a close request can bring this loss to the dispatcher.
+LoseWorker(s) ==
+    /\ faults > 0 /\ Bound(s) /\ q[s].runtime = "running"
+    /\ q[s].command = "none" /\ ~q[s].closed
+    /\ \E result \in {"gone", "resumable"}:
+         q' = [q EXCEPT ![s].runtime = result, ![s].workerPC = "wait",
+                ![s].interruptedAt = IF q[s].lock /\ q[s].response # "none" THEN "final"
+                    ELSE IF q[s].responseTemp # "none" THEN "temp" ELSE "review"]
+    /\ faults' = faults - 1
+    /\ UNCHANGED service
 
-RemoveCleanupImplementorTxt ==
-    /\ impl = "cleaning"
-    /\ ~files.roundComplete
-    /\ files.implementorToReviewerTxt
-    /\ files' = [
-        files EXCEPT !.implementorToReviewerTxt = FALSE
-        ]
-    /\ UNCHANGED <<
-        impl,
-        reviewer,
-        content,
-        request,
-        faults
-        >>
+CrashDispatcher ==
+    /\ faults > 0 /\ service.mode = "running"
+    /\ \A s \in Sessions : q[s].command = "none"
+    /\ service' = [service EXCEPT !.mode = "down", !.recover = {}]
+    /\ faults' = faults - 1
+    /\ UNCHANGED q
 
-\* The concrete CLI empties the retained reviewer final and atomically renames
-\* that same entry to the completion marker. This action models that promotion.
-PublishCompletion ==
-    /\ impl = "cleaning"
-    /\ ~files.roundComplete
-    /\ ~files.reviewLock
-    /\ ~files.reviewerToImplementorTmp
-    /\ files.reviewerToImplementorTxt
-    /\ ~files.implementorToReviewerTmp
-    /\ ~files.implementorToReviewerTxt
-    /\ request.active
-    /\ request.decisionCount = 1
-    /\ request.feedbackKind = "noFindings"
-    /\ impl' = "awaitingShutdownAck"
-    /\ files' = [
-        files EXCEPT
-            !.reviewerToImplementorTxt = FALSE,
-            !.roundComplete = TRUE
-        ]
-    /\ request' = [
-        request EXCEPT
-            !.active = FALSE,
-            !.decisionCount = 0,
-            !.submittedImplementorMessagePresent = FALSE
-        ]
-    /\ UNCHANGED <<
-        reviewer,
-        content,
-        faults
-        >>
+BeginShutdown ==
+    /\ EnableServiceLifecycle /\ service.mode = "running"
+    /\ \A s \in Sessions : q[s].command = "none"
+    /\ service' = [service EXCEPT !.mode = "shutdown",
+                        !.recover = {s \in Sessions : ~q[s].closed},
+                        !.idleShutdownHandle = [s \in Sessions |->
+                            IF Open(s) /\ q[s].phase = "idle" /\ Bound(s)
+                            THEN q[s].handle ELSE 0]]
+    /\ UNCHANGED <<q, faults>>
 
-\* Negative mutation: completion is published while another file remains.
-EarlyPublishCompletionMarker ==
-    /\ EnableEarlyCompletionPublication
-    /\ impl = "cleaning"
-    /\ ~files.roundComplete
-    /\ ~FilesExceptCompletionAbsent
-    /\ impl' = "awaitingShutdownAck"
-    /\ files' = [files EXCEPT !.roundComplete = TRUE]
-    /\ UNCHANGED <<
-        reviewer,
-        content,
-        request,
-        faults
-        >>
+\* A repeated shutdown command obtains fresh observations, including errors.
+RetryShutdown ==
+    /\ service.mode = "shutdown" /\ service.recover = {}
+    /\ \A s \in Sessions : q[s].command = "none"
+    /\ \E s \in Sessions : ~q[s].closed /\ (Live(s) \/ q[s].error # "none")
+    /\ service' = [service EXCEPT !.recover = {s \in Sessions : ~q[s].closed}]
+    /\ UNCHANGED <<q, faults>>
 
-\* The reviewer uses only its own participation state and the observable
-\* completion marker; it does not read private implementor control state.
-AcknowledgeCompletion ==
-    /\ reviewer = "pollingParticipated"
-    /\ files.roundComplete
-    /\ reviewer' = "done"
-    /\ files' = [files EXCEPT !.roundComplete = FALSE]
-    /\ UNCHANGED <<
-        impl,
-        content,
-        request,
-        faults
-        >>
+FinishShutdown ==
+    /\ service.mode = "shutdown" /\ service.recover = {}
+    /\ \A s \in Sessions : /\ q[s].command = "none"
+                             /\ ~Live(s) /\ q[s].error = "none"
+    /\ service' = [service EXCEPT !.mode = "off", !.recover = {}, !.stoppedOnce = TRUE]
+    /\ UNCHANGED <<q, faults>>
 
-ObserveCompletionAcknowledged ==
-    /\ impl = "awaitingShutdownAck"
-    /\ reviewer = "done"
-    /\ AllFilesAbsent
-    /\ impl' = "done"
-    /\ UNCHANGED <<
-        reviewer,
-        files,
-        content,
-        request,
-        faults
-        >>
+\* A later runtime inspection may offer resume of a conversation whose prior
+\* execution was confirmed stopped. This changes only
+\* the observation, not execution; RuntimeResume is still required.
+ObserveResumeAvailable(s) ==
+    /\ service.mode = "running" /\ service.stoppedOnce
+    /\ s \in service.recover /\ Open(s)
+    /\ Bound(s) /\ q[s].runtime = "stopped" /\ q[s].command = "none"
+    /\ q' = [q EXCEPT ![s].runtime = "resumable"]
+    /\ UNCHANGED <<service, faults>>
 
-\* This self-loop keeps deadlock checking enabled at valid termination.
-TerminalStutter ==
-    /\ impl = "done"
-    /\ reviewer = "done"
-    /\ UNCHANGED <<
-        impl,
-        reviewer,
-        files,
-        content,
-        request,
-        faults
-        >>
+PairProgress(s) ==
+    PrepareContext(s) \/ PromoteContext(s) \/ QueueDispatch(s) \/ RequestReview(s) \/
+    ReadRequest(s) \/ WriteResponseTemp(s) \/ PromoteResponse(s) \/
+    RecoverPublishedResponse(s) \/ ReleaseReview(s) \/
+    ConsumeResponse(s) \/ Acknowledge(s) \/ WorkerSeesClose(s) \/ FinishTurn(s)
+RuntimeSuccess(s) == RuntimeLaunchBind(s) \/ RuntimeResume(s) \/ RuntimeStop(s)
+LocalStep(s) == PairProgress(s) \/ RequestClose(s) \/ Dispatch(s) \/
+                DispatchError(s) \/ RuntimeSuccess(s) \/ RuntimeFailure(s) \/ LoseWorker(s) \/ ObserveResumeAvailable(s)
+
+\* Deliberately wrong transitions; each negative config names its expected failure.
+BadUnlock(s) ==
+    /\ Mutation \in {"earlyUnlock", "tempUnlock"}
+    /\ q[s].lock /\ q[s].response = "none"
+    /\ q[s].workerPC = IF Mutation = "tempUnlock" THEN "promote" ELSE "review"
+    /\ q' = [q EXCEPT ![s].lock = FALSE]
+    /\ UNCHANGED <<service, faults>>
+BadRoute(s, t) ==
+    /\ Mutation = "crossSession" /\ s # t
+    /\ q[s].response # "none"
+    /\ q' = [q EXCEPT ![t].response = q[s].response,
+                     ![t].responseOwner = s, ![t].responseRound = q[s].responseRound]
+    /\ UNCHANGED <<service, faults>>
+BadClose(s) ==
+    /\ Mutation = "closeBeforeStop" /\ q[s].close /\ Live(s)
+    /\ q' = [q EXCEPT ![s].closed = TRUE]
+    /\ UNCHANGED <<service, faults>>
+BadRecovery(s) ==
+    /\ Mutation = "dropFeedback" /\ s \in service.recover
+    /\ q[s].response # "none"
+    /\ q' = [q EXCEPT ![s].response = "none"]
+    /\ UNCHANGED <<service, faults>>
+BadReplacement(s) ==
+    /\ Mutation = "replaceRunning" /\ Live(s) /\ q[s].handle < MaxHandles
+    /\ q' = [q EXCEPT ![s].handle = @ + 1]
+    /\ UNCHANGED <<service, faults>>
+BadShutdown(s) ==
+    /\ Mutation = "shutdownCloses" /\ service.mode = "shutdown"
+    /\ ~q[s].closed /\ ~q[s].close /\ ~Live(s)
+    /\ q' = [q EXCEPT ![s].closed = TRUE]
+    /\ UNCHANGED <<service, faults>>
 
 Next ==
-    \/ StartupCleanupStep
-    \/ FinishStartupCleanup
-    \/ StartReviewer
-    \/ FinishImplementationPhase
-    \/ ClearImplementorMessage
-    \/ ReuseImplementorMessage
-    \/ StartImplementorMessage
-    \/ PublishImplementorMessage
-    \/ FinishImplementorMessage
-    \/ FinishInitialPreparation
-    \/ AcknowledgeReviewerMessage
-    \/ RequestReview
-    \/ LosePollingLock
-    \/ LoseActiveReviewLock
-    \/ RetryMissingRequest
-    \/ BeginReview
-    \/ AbortReviewAfterLockLoss
-    \/ StartPublishingFeedback
-    \/ PublishFeedback
-    \/ ReleaseFeedback
-    \/ EarlyUnlockBeforePublishing
-    \/ EarlyUnlockWithFeedbackTemp
-    \/ ObserveReviewerFeedback
-    \/ ApplyReviewerFeedback
-    \/ ContinueAfterNoFindings
-    \/ BeginCompletionCleanup
-    \/ RemoveCleanupReviewerTmp
-    \/ RemoveCleanupImplementorTmp
-    \/ RemoveCleanupImplementorTxt
-    \/ PublishCompletion
-    \/ EarlyPublishCompletionMarker
-    \/ AcknowledgeCompletion
-    \/ ObserveCompletionAcknowledged
-    \/ TerminalStutter
+    \/ \E s \in Sessions : LocalStep(s)
+    \/ StartService \/ OperatorRevive \/ CrashDispatcher
+    \/ BeginShutdown \/ RetryShutdown \/ FinishShutdown
+    \/ \E s \in Sessions : BadUnlock(s) \/ BadClose(s) \/ BadRecovery(s) \/
+                            BadReplacement(s) \/ BadShutdown(s)
+    \/ \E s, t \in Sessions : BadRoute(s, t)
 
-Fairness ==
-    /\ WF_vars(StartupCleanupStep)
-    /\ WF_vars(FinishStartupCleanup)
-    /\ WF_vars(StartReviewer)
-    /\ WF_vars(FinishImplementationPhase)
-    /\ WF_vars(ClearImplementorMessage)
-    /\ WF_vars(ReuseImplementorMessage)
-    /\ WF_vars(StartImplementorMessage)
-    /\ WF_vars(PublishImplementorMessage)
-    /\ WF_vars(FinishImplementorMessage)
-    /\ WF_vars(FinishInitialPreparation)
-    /\ WF_vars(AcknowledgeReviewerMessage)
-    /\ WF_vars(RequestReview)
-    /\ WF_vars(RetryMissingRequest)
-    /\ WF_vars(BeginReview)
-    /\ WF_vars(AbortReviewAfterLockLoss)
-    /\ WF_vars(StartPublishingFeedback)
-    /\ WF_vars(PublishFeedback)
-    /\ WF_vars(ReleaseFeedback)
-    /\ WF_vars(ObserveReviewerFeedback)
-    /\ WF_vars(ApplyReviewerFeedback)
-    /\ WF_vars(ContinueAfterNoFindings)
-    /\ WF_vars(BeginCompletionCleanup)
-    /\ WF_vars(RemoveCleanupReviewerTmp)
-    /\ WF_vars(RemoveCleanupImplementorTmp)
-    /\ WF_vars(RemoveCleanupImplementorTxt)
-    /\ WF_vars(PublishCompletion)
-    /\ WF_vars(AcknowledgeCompletion)
-    /\ WF_vars(ObserveCompletionAcknowledged)
-
-Spec == Init /\ [][Next]_vars /\ Fairness
+SafetySpec == Init /\ [][Next]_vars
+\* Only healthy configurations use these assumptions. Neither revive, stop
+\* failures, shutdown retries, nor crash recovery are promised to happen.
+LiveSpec == SafetySpec /\ WF_vars(StartService) /\
+    \A s \in Sessions : WF_vars(PairProgress(s)) /\ WF_vars(Dispatch(s)) /\
+                         WF_vars(RuntimeSuccess(s))
 
 TypeOK ==
-    /\ impl \in ImplStates
-    /\ reviewer \in ReviewerStates
-    /\ files \in FileStates
-    /\ content \in ContentStates
-    /\ request \in RequestStates
-    /\ faults \in FaultStates
+    /\ DOMAIN q = Sessions
+    /\ service \in [mode : {"off", "running", "down", "shutdown"}, recover : SUBSET Sessions,
+                       stoppedOnce : BOOLEAN, restarted : BOOLEAN,
+                       idleShutdownHandle : [Sessions -> 0..MaxHandles]]
+    /\ faults \in 0..FaultBudget
+    /\ \A s \in Sessions :
+       /\ q[s] \in [closed : BOOLEAN, close : BOOLEAN, handle : 0..MaxHandles,
+            runtime : {"gone", "running", "resumable", "stopped"},
+            command : Commands, error : {"none", "runtime", "close"},
+            phase : {"idle", "contextTemp", "ready", "waiting", "received"},
+            round : 0..MaxRounds, accepted : 0..MaxRounds, context : 0..MaxRounds,
+            contextTemp : BOOLEAN, lock : BOOLEAN, responseTemp : Kinds,
+            dispatch : BOOLEAN, deferred : BOOLEAN,
+            response : Kinds, responseOwner : Sessions, responseRound : 0..MaxRounds,
+            decisions : 0..1, workerPC : {"wait", "review", "promote", "release", "end"},
+            reviewedRound : 0..MaxRounds, interruptedAt : {"none", "review", "temp", "final"}]
+       /\ q[s].accepted <= q[s].round
 
-ReviewerStartsAfterStartupCleanup ==
-    (reviewer # "offline") => ProtocolStarted
+RequestHasContext == \A s \in Sessions :
+    q[s].lock => q[s].context = q[s].round /\ q[s].round > 0 /\ ~q[s].contextTemp
+ResponseMatchesSession == \A s \in Sessions : q[s].response # "none" =>
+    /\ q[s].responseOwner = s /\ q[s].responseRound = q[s].round
+    /\ q[s].decisions = 1 /\ q[s].responseTemp = "none"
+ClosedOnlyAfterStop == \A s \in Sessions : q[s].closed =>
+    q[s].close /\ ~Live(s) /\ q[s].command = "none"
+StoppedServiceHasNoWorkers == service.mode = "off" =>
+    \A s \in Sessions : ~Live(s) /\ q[s].command = "none"
+FrozenPendingContext == \A s \in Sessions : q[s].phase = "waiting" =>
+    q[s].context = q[s].round /\ ~q[s].contextTemp
+ReviewedSubmittedRound == \A s \in Sessions :
+    q[s].workerPC \in {"review", "promote"} => q[s].reviewedRound = q[s].round
+IdleWorkersStayDormant == [] [\A s \in Sessions :
+    (~WorkerCanRun(s) /\ q'[s].runtime = "running") => q[s].lock]_vars
 
-\* The snapshot remains frozen while its lock exists and across a missing-lock
-\* retry gap for the same logical request.
-ImplementationFrozenThroughReview ==
-    (ProtocolStarted
-        /\ (files.reviewLock \/
-            (request.active
-                /\ request.decisionCount = 0
-                /\ ~files.roundComplete))) =>
-        content.code = content.submittedCode
+PublicationBeforeUnlock == [] [\A s \in Sessions :
+    (q[s].lock /\ ~q'[s].lock) =>
+        q[s].response # "none" /\ q[s].responseTemp = "none"]_vars
+FeedbackPreservedUntilAcknowledged == [] [\A s \in Sessions :
+    (q[s].response # "none" /\ q'[s].response # q[s].response) =>
+        /\ Open(s) /\ q[s].phase = "received" /\ ~q[s].lock
+        /\ q'[s].phase = "idle" /\ q'[s].response = "none"]_vars
+NoAcceptanceAfterClose == [] [\A s \in Sessions :
+    (q[s].close \/ q[s].closed) => q'[s].accepted = q[s].accepted]_vars
+ClosedStaysClosed == [] [\A s \in Sessions : q[s].closed => q'[s].closed]_vars
+HandleChangesOnlyWhenUnavailable == [] [\A s \in Sessions :
+    (q[s].handle # 0 /\ q'[s].handle # q[s].handle) => ~Live(s)]_vars
+\* Separation holds by construction in LocalStep. This is structural bookkeeping,
+\* not a proof of Python folder/path routing; the process tests provide that evidence.
+SessionIsolation == [] [\A s \in Sessions : LocalStep(s) =>
+    \A t \in Sessions \ {s} : q'[t] = q[t]]_vars
 
-ImplementorMessageFrozenThroughReview ==
-    (ProtocolStarted
-        /\ ~files.roundComplete
-        /\ (files.reviewLock \/
-            (request.active /\ request.decisionCount = 0))) =>
-        /\ files.implementorToReviewerTxt =
-            request.submittedImplementorMessagePresent
-        /\ (~files.implementorToReviewerTxt \/
-            content.implementorMessage =
-                content.submittedImplementorMessage)
+RequestEventuallyResolved == \A s \in Sessions :
+    (q[s].phase = "waiting" /\ ~q[s].closed) ~>
+        (q[s].accepted = q[s].round \/ q[s].closed)
+CloseEventuallyConfirmed == \A s \in Sessions : q[s].close ~> q[s].closed
 
-ReviewRequestsIncludeImplementorContext ==
-    (ProtocolStarted
-        /\ request.active
-        /\ request.decisionCount = 0) =>
-        /\ request.submittedImplementorMessagePresent
-        /\ files.implementorToReviewerTxt
-
-ImplementorMessagePublicationIsAtomic ==
-    ProtocolStarted =>
-        /\ ~(files.implementorToReviewerTmp /\
-             files.implementorToReviewerTxt)
-        /\ (files.implementorToReviewerTmp =>
-            /\ ~files.reviewLock
-            /\ impl = "writingMessage")
-
-ReviewerMessagePublicationIsAtomic ==
-    ProtocolStarted =>
-        /\ ~(files.reviewerToImplementorTmp /\
-             files.reviewerToImplementorTxt)
-        /\ (files.reviewerToImplementorTmp =>
-            reviewer = "publishingFeedback")
-
-ReviewerMessagePublicationStartsWhileLocked ==
-    [][~files.reviewerToImplementorTmp
-        /\ files.reviewerToImplementorTmp' =>
-            files.reviewLock]_vars
-
-ReviewerMessageFrozenUntilConsumed ==
-    [][ProtocolStarted
-        /\ request.active
-        /\ request.decisionCount = 1
-        /\ impl # "cleaning"
-        /\ ~files.roundComplete
-        /\ request.active' =>
-            /\ files.reviewerToImplementorTxt'
-            /\ content.reviewerMessage' = content.reviewerMessage]_vars
-
-ReviewerUsesFrozenSnapshot ==
-    (ProtocolStarted /\ ReviewerActive /\ files.reviewLock) =>
-        /\ request.active
-        /\ content.reviewedCode = content.submittedCode
-        /\ request.submittedImplementorMessagePresent
-        /\ files.implementorToReviewerTxt
-        /\ content.implementorMessage =
-            content.submittedImplementorMessage
-
-ReviewerMessagePublishedBeforeUnlock ==
-    [][files.reviewLock
-        /\ ~files.reviewLock'
-        /\ reviewer' # reviewer =>
-            files.reviewerToImplementorTxt]_vars
-
-DecisionAccounting ==
-    ProtocolStarted =>
-        /\ (~request.active => request.decisionCount = 0)
-        /\ (files.roundComplete =>
-            /\ ~request.active
-            /\ request.decisionCount = 0
-            /\ request.feedbackKind = "noFindings"
-            /\ ~files.reviewerToImplementorTmp
-            /\ ~files.reviewerToImplementorTxt)
-        /\ (request.active /\ request.decisionCount = 1 =>
-            /\ request.feedbackKind \in ReviewerFeedbackKinds
-            /\ (impl # "cleaning" =>
-                files.reviewerToImplementorTxt))
-        /\ (request.active /\ request.decisionCount = 0 =>
-            /\ request.feedbackKind = "none"
-            /\ ~files.roundComplete
-            /\ ~files.reviewerToImplementorTxt)
-        /\ (~request.active
-            /\ impl # "awaitingShutdownAck"
-            /\ impl # "done" =>
-                request.feedbackKind = "none")
-
-RequestStateIsConsistent ==
-    ProtocolStarted =>
-        /\ (files.reviewLock => request.active)
-        /\ ((files.reviewerToImplementorTmp \/
-             files.reviewerToImplementorTxt) => request.active)
-        /\ (~request.active =>
-            /\ ~files.reviewLock
-            /\ ~files.reviewerToImplementorTmp
-            /\ ~files.reviewerToImplementorTxt)
-
-HandlingRequiresReviewerMessage ==
-    /\ (impl = "handling" =>
-        /\ ~files.reviewLock
-        /\ request.active
-        /\ request.decisionCount = 1
-        /\ files.reviewerToImplementorTxt)
-    /\ ((request.active /\
-            impl \in {
-                "readyToMessage",
-                "writingMessage",
-                "messagePublished",
-                "acknowledging"
-                }) =>
-            /\ ~files.reviewLock
-            /\ request.decisionCount = 1
-            /\ files.reviewerToImplementorTxt)
-    /\ (impl = "cleaning" =>
-        /\ ~files.reviewLock
-        /\ request.active
-        /\ request.decisionCount = 1
-        /\ request.feedbackKind = "noFindings")
-
-CompletionHasPriority ==
-    (ProtocolStarted /\ files.roundComplete) =>
-        /\ impl = "awaitingShutdownAck"
-        /\ reviewer = "pollingParticipated"
-        /\ FilesExceptCompletionAbsent
-        /\ request.feedbackKind = "noFindings"
-
-CompletionRequiresNoFindings ==
-    (impl \in {"cleaning", "awaitingShutdownAck", "done"}) =>
-        request.feedbackKind = "noFindings"
-
-ReviewerTerminatesOnlyAfterCompletion ==
-    (reviewer = "done") =>
-        /\ impl \in {"awaitingShutdownAck", "done"}
-        /\ AllFilesAbsent
-        /\ ~request.active
-        /\ request.feedbackKind = "noFindings"
-
-SuccessfulTerminationIsClean ==
-    (impl = "done") =>
-        /\ reviewer = "done"
-        /\ AllFilesAbsent
-        /\ ~request.active
-        /\ request.decisionCount = 0
-        /\ request.feedbackKind = "noFindings"
-
-CompletionMarkerPublishedLast ==
-    [][~files.roundComplete /\ files.roundComplete' =>
-        /\ ~files.reviewLock
-        /\ ~files.reviewerToImplementorTmp
-        /\ files.reviewerToImplementorTxt
-        /\ ~files.implementorToReviewerTmp
-        /\ ~files.implementorToReviewerTxt
-        /\ FilesExceptCompletionAbsent'
-        /\ impl = "cleaning"
-        /\ impl' = "awaitingShutdownAck"
-        /\ request.feedbackKind = "noFindings"]_vars
-
-CompletionMarkerRemovedLast ==
-    [][files.roundComplete /\ ~files.roundComplete' =>
-        FilesExceptCompletionAbsent]_vars
-
-CompletionAcknowledgedByParticipatingReviewer ==
-    [][files.roundComplete
-        /\ ~files.roundComplete'
-        /\ impl # "starting" =>
-            /\ impl = "awaitingShutdownAck"
-            /\ reviewer = "pollingParticipated"
-            /\ reviewer' = "done"]_vars
-
-ExactlyOneDecisionPerLogicalRequest ==
-    /\ ((request.active /\ request.decisionCount = 0)
-        ~> (request.decisionCount = 1))
-    /\ [][request.active
-        /\ request.active'
-        /\ request.decisionCount = 1 =>
-            request.decisionCount' = 1]_vars
-    /\ [][request.active /\ ~request.active' =>
-        /\ request.decisionCount = 1
-        /\ request.decisionCount' = 0]_vars
-
-StartupCleanupEventuallyFinishes ==
-    (impl = "starting") ~> (impl = "editing" /\ AllFilesAbsent)
-
-ReviewerEventuallyStarts ==
-    (reviewer = "offline" /\ ProtocolStarted) ~>
-        (reviewer # "offline")
-
-ReviewRequestEventuallyReleased ==
-    (ProtocolStarted /\ files.reviewLock) ~> ~files.reviewLock
-
-NoFindingsEventuallyContinuesOrShutsDown ==
-    (impl = "handling" /\ request.feedbackKind = "noFindings") ~>
-        (impl # "handling")
-
-ReviewerMessageEventuallyConsumed ==
-    (ProtocolStarted /\ files.reviewerToImplementorTxt) ~>
-        ~files.reviewerToImplementorTxt
-
-ImplementorContextEventuallyAvailable ==
-    (ProtocolStarted
-        /\ impl = "readyToMessage"
-        /\ ~files.implementorToReviewerTxt) ~>
-            files.implementorToReviewerTxt
-
-ReviewerMessageTempEventuallyPublished ==
-    (ProtocolStarted
-        /\ files.reviewerToImplementorTmp
-        /\ reviewer = "publishingFeedback"
-        /\ files.reviewLock) ~>
-            files.reviewerToImplementorTxt
-
-ImplementorMessageTempEventuallyPublished ==
-    (ProtocolStarted
-        /\ files.implementorToReviewerTmp
-        /\ impl = "writingMessage") ~>
-            files.implementorToReviewerTxt
-
-CompletionEventuallyAcknowledged ==
-    (impl = "awaitingShutdownAck" /\ files.roundComplete) ~>
-        (reviewer = "done" /\ ~files.roundComplete)
-
-ShutdownEventuallyFinishes ==
-    (impl = "awaitingShutdownAck") ~> (impl = "done")
-
+\* Reachability checks intentionally violate these predicates. They guard
+\* against a successful but vacuous safety run that never reaches the feature.
+NoTwoRoundsWitness == ~\E s \in Sessions : q[s].accepted = 2 /\ q[s].handle = 1
+NoDeferredRoundWitness == ~\E s \in Sessions :
+    q[s].deferred /\ q[s].lock /\ q[s].workerPC = "end" /\
+    q[s].reviewedRound < q[s].round
+NoConcurrentWitness == ~\E s, t \in Sessions : s # t /\
+    q[s].workerPC = "review" /\ q[t].workerPC = "review"
+NoRecoveryReleaseWitness == ~\E s \in Sessions :
+    q[s].handle = 2 /\ q[s].interruptedAt = "final" /\
+    q[s].response # "none" /\ ~q[s].lock
+NoRecoveryTempWitness == ~\E s \in Sessions :
+    q[s].handle = 2 /\ q[s].interruptedAt = "temp" /\ q[s].accepted = 1
+NoRestartIdleWitness == ~\E s \in Sessions :
+    service.mode = "running" /\ service.restarted /\
+    service.idleShutdownHandle[s] > 0 /\
+    q[s].handle = service.idleShutdownHandle[s] /\
+    q[s].runtime \in {"resumable", "stopped"} /\ q[s].phase = "idle" /\
+    s \notin service.recover
+NoRestartReplacementWitness == ~\E s \in Sessions :
+    service.mode = "running" /\ service.restarted /\
+    service.idleShutdownHandle[s] > 0 /\
+    q[s].handle > service.idleShutdownHandle[s] /\
+    q[s].runtime = "running" /\ q[s].phase = "waiting" /\ q[s].round = 2
+LostWorkerEventuallyRecovers == \A s \in Sessions :
+    (Bound(s) /\ q[s].runtime = "gone" /\ ~q[s].close /\ ~q[s].closed) ~>
+        (WorkerCanRun(s) \/ q[s].closed)
 =============================================================================

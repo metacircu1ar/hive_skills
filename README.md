@@ -37,21 +37,23 @@ panels, durable workflow artifacts, and bounded multi-repository execution.
 
 | Skill | Purpose |
 | --- | --- |
-| [`code-review-loop`](skills/code-review-loop/SKILL.md) | Coordinate an `implementor` and persistent `reviewer` through session-isolated frozen-diff cycles, `NO_FINDINGS` work-item boundaries, and caller- or implementor-controlled session completion; the protocol includes [TLA+ state-machine verification](skills/code-review-loop/verification/README.md). |
-| [`parallel-code-review-loop`](skills/parallel-code-review-loop/SKILL.md) | Schedule multiple independent `code-review-loop` pairs across distinct repository working paths, pass shared and assignment-specific context to implementors, enforce per-pair startup order, and wait for all pairs to terminate. See the [one-workspace, N-repository example](skills/parallel-code-review-loop/README.md). |
+| [`code-review-loop`](skills/code-review-loop/SKILL.md) | Share one dispatcher across implementation/static-review rounds. Use a fresh reviewer session per round by default, or resume the same conversation with `session-mode=reuse`. Workers finish each turn; scripts handle coordination, closure, and revival. |
+| [`parallel-code-review-loop`](skills/parallel-code-review-loop/SKILL.md) | Start one dispatcher and multiple implementors with shared and task-specific context, supplied repository paths, and one coordination directory. See the [one-workspace, N-repository example](skills/parallel-code-review-loop/README.md). |
 | [`hive-review-loop`](skills/hive-review-loop/SKILL.md) | Run one repository through a named `hive_registry` implementor and a configurable parallel reviewer panel using `hive_workflow`; it launches no Codex subagents. |
 | [`hive-parallel-review-loop`](skills/hive-parallel-review-loop/SKILL.md) | Run multiple disjoint repository review loops as bounded concurrent `hive_workflow` processes, with shared defaults and per-assignment registry-agent overrides in YAML. |
 
-For one pair, invoke `code-review-loop` on both agents with the appropriate role:
+Start a dispatcher, then invoke implementors for their tasks in the same coordination directory:
 
 ```text
-/code-review-loop implementor
-/code-review-loop reviewer
+/code-review-loop reviewer coord=/workspace
+/code-review-loop implementor coord=/workspace
 ```
 
-Omitting completion authority on the implementor defaults it to `completion-authority=implementor`. The reviewer has no completion-authority input. Use `completion-authority=caller` only on the implementor when an enclosing workflow, such as an epic implementor, must keep the reviewer alive across multiple work items and close the session itself. Continue such a session by resuming the same initialized implementor role; a fresh implementor invocation would perform startup cleanup and must begin a new session instead.
+The dispatcher creates all reviewer workers; implementors never launch reviewers. Implementors default to `session-mode=fresh`: close the session after every result, including findings, and open a new one for the next round. Use `session-mode=reuse` to keep the same reviewer conversation, resumed by the dispatcher only when work arrives. Return to a session with `session=<id>`. Omitted completion authority defaults to `implementor`; `completion-authority=caller` lets an enclosing workflow decide when work ends, while fresh sessions still close after each review. All coordination-file access uses supplied scripts. Workers end each turn; implementors and the dispatcher prefer silent background waits with completion notifications. Every dispatcher start recovers open sessions without waking idle workers; use `revive` after an unclean stop or to restore dispatch in an existing conversation.
 
-For multiple independent repositories, invoke `parallel-code-review-loop` on one orchestrator with its input manifest. The orchestrator validates disjoint repository roots and complete-pair capacity, then launches one `code-review-loop` implementor/reviewer pair per repository. Install the complete directories for both coordination skills because the parallel wrapper depends on the base protocol and its scripts.
+For multiple assignments, invoke `parallel-code-review-loop` with a manifest containing `coordination_dir`, shared context, and per-task repository paths and context. Optional `session_mode` defaults to `fresh`. The wrapper starts one dispatcher and the implementors, then verifies each implementor's result and closure of all its sessions. It imposes no pair limit or source-path separation checks. Install both complete skill directories because the wrapper depends on the base scripts.
+
+After participants finish their result and closure checks, `dispatcher_loop.py cleanup-closed --coordination-dir /workspace` deletes closed sessions and their artifacts to keep them out of future scans. Open sessions remain; cleanup is explicit and keeps no archive.
 
 For provider-neutral agent panels, use the Hive-backed variants. They call
 [`hive_registry`](https://github.com/metacircu1ar/hive_registry) and
@@ -125,9 +127,9 @@ skills/audit/<skill-name>/
 skills/*-skill.md               Standalone workflow skills and references
 skills/error-logging-review/     Focused error-handling and logging review pass
 skills/test-quality-review/      Language- and framework-independent test-quality pass
-skills/code-review-loop/         Two-agent implementation/review coordination skill
-skills/code-review-loop/verification/  TLA+ model, checks, and reproducibility notes
-skills/parallel-code-review-loop/  Multi-repository orchestration over isolated review pairs
+skills/code-review-loop/         Shared dispatcher and persistent review sessions
+skills/code-review-loop/verification/  Bounded session/dispatcher TLA+ checks
+skills/parallel-code-review-loop/  Multiple assignments using one review dispatcher
 skills/hive-review-loop/       Hive-backed implementation and reviewer-panel loop
 skills/hive-parallel-review-loop/  Bounded multi-repository Hive workflow launcher
 skills/verified-commit-split/    Content-preserving Git commit-splitting skill

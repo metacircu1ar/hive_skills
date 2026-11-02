@@ -4,31 +4,38 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import sys
+import tempfile
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 REVIEW_LOCK = ".hive_skills_review_lock"
+DISPATCH_REQUEST = "dispatch-request"
 IMPLEMENTOR_FINAL = ".hive_skills_implementor_to_reviewer.txt"
 REVIEWER_FINAL = ".hive_skills_reviewer_to_implementor.txt"
-ROUND_COMPLETE = ".hive_skills_review_round_complete"
+CLOSE_REQUEST = "close-request"
+STATE_FILE = "state.json"
+SERVICE_DIRECTORY = ".hive_skills_reviews"
+DISPATCHER_LOCK = "dispatcher.lock"
 IMPLEMENTOR_TEMP = ".hive_skills_implementor_to_reviewer.tmp"
 REVIEWER_TEMP = ".hive_skills_reviewer_to_implementor.tmp"
 
 PROTOCOL_FILES = (
     REVIEW_LOCK,
+    DISPATCH_REQUEST,
     IMPLEMENTOR_FINAL,
     REVIEWER_FINAL,
-    ROUND_COMPLETE,
+    CLOSE_REQUEST,
     IMPLEMENTOR_TEMP,
     REVIEWER_TEMP,
 )
-MARKER_FILES = frozenset((REVIEW_LOCK, ROUND_COMPLETE))
+MARKER_FILES = frozenset((REVIEW_LOCK, DISPATCH_REQUEST, CLOSE_REQUEST))
 POLL_INTERVAL_SECONDS = 1.0
-STALE_STATE_GRACE_SECONDS = 90.0
 
 
 class ProtocolError(RuntimeError):
@@ -38,18 +45,20 @@ class ProtocolError(RuntimeError):
 @dataclass(frozen=True)
 class Snapshot:
     review_lock: bool
+    dispatch_requested: bool
     implementor_final: bool
     reviewer_final: bool
-    round_complete: bool
+    close_requested: bool
     implementor_temp: bool
     reviewer_temp: bool
 
     def present_names(self) -> list[str]:
         values = {
             REVIEW_LOCK: self.review_lock,
+            DISPATCH_REQUEST: self.dispatch_requested,
             IMPLEMENTOR_FINAL: self.implementor_final,
             REVIEWER_FINAL: self.reviewer_final,
-            ROUND_COMPLETE: self.round_complete,
+            CLOSE_REQUEST: self.close_requested,
             IMPLEMENTOR_TEMP: self.implementor_temp,
             REVIEWER_TEMP: self.reviewer_temp,
         }
@@ -125,9 +134,10 @@ def snapshot(coordination_directory: Path) -> Snapshot:
 
     return Snapshot(
         review_lock=presence[REVIEW_LOCK],
+        dispatch_requested=presence[DISPATCH_REQUEST],
         implementor_final=presence[IMPLEMENTOR_FINAL],
         reviewer_final=presence[REVIEWER_FINAL],
-        round_complete=presence[ROUND_COMPLETE],
+        close_requested=presence[CLOSE_REQUEST],
         implementor_temp=presence[IMPLEMENTOR_TEMP],
         reviewer_temp=presence[REVIEWER_TEMP],
     )
@@ -253,6 +263,130 @@ def promote_channel(
         raise ProtocolError(
             f"cannot publish channel {temp_path} -> {final_path}: {exc}"
         ) from exc
+
+
+def atomic_write(path: Path, body: str) -> None:
+    """Publish complete metadata without exposing a partially written final file."""
+    descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def service_directory(coordination_directory: Path) -> Path:
+    root = coordination_directory / SERVICE_DIRECTORY
+    for directory in (root, root / "sessions"):
+        if directory.is_symlink():
+            raise ProtocolError(
+                f"protocol directory must not be a symlink: {directory}"
+            )
+        directory.mkdir(exist_ok=True)
+    if not (root / ".gitignore").exists():
+        atomic_write(root / ".gitignore", "*\n")
+    return root
+
+
+def open_session(coordination_directory: Path) -> Path:
+    directory = (
+        service_directory(coordination_directory) / "sessions" / uuid.uuid4().hex
+    )
+    directory.mkdir()
+    return directory
+
+
+def resolve_session(coordination_directory: Path, session: str) -> Path:
+    root = service_directory(coordination_directory) / "sessions"
+    candidate = Path(session)
+    if not candidate.is_absolute():
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", session):
+            raise ProtocolError(
+                "invalid session ID; use the ID returned by open-session"
+            )
+        candidate = root / session
+    if candidate.is_symlink() or candidate.parent.resolve() != root.resolve():
+        raise ProtocolError(f"session must belong to {root}: {session}")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ProtocolError(
+            f"session does not exist: {session}; use open-session first"
+        ) from exc
+    if not resolved.is_dir():
+        raise ProtocolError(f"session is not a directory: {session}")
+    return resolved
+
+
+def read_session_state(directory: Path) -> dict[str, Any]:
+    path = directory / STATE_FILE
+    kind = _path_kind(path)
+    if kind == "absent":
+        if _path_kind(directory) != "directory":
+            raise ProtocolError(
+                f"session directory is missing or not a directory: {directory}"
+            )
+        return {"status": "open", "worker_handle": None, "error": None}
+    if kind != "file":
+        raise ProtocolError(f"session state must be an ordinary file: {path}")
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ProtocolError(f"cannot read session state {path}: {exc}") from exc
+    if not isinstance(state, dict) or state.get("status") not in ("open", "closed"):
+        raise ProtocolError(f"invalid session status in {path}")
+    if "worker_handle" not in state:
+        raise ProtocolError(f"session state is missing worker_handle: {path}")
+    handle = state.get("worker_handle")
+    if handle is not None and (not isinstance(handle, str) or not handle.strip()):
+        raise ProtocolError(f"invalid worker handle in {path}")
+    return state
+
+
+def save_session_state(directory: Path, state: dict[str, Any]) -> None:
+    atomic_write(directory / STATE_FILE, json.dumps(state, indent=2) + "\n")
+
+
+def marker_present(directory: Path, name: str) -> bool:
+    metadata = _inspect_path(directory / name)
+    if metadata is None:
+        return False
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size:
+        raise ProtocolError(
+            f"marker must be an empty ordinary file: {directory / name}"
+        )
+    return True
+
+
+def session_closing(directory: Path) -> bool:
+    return (
+        marker_present(directory, CLOSE_REQUEST)
+        or read_session_state(directory)["status"] == "closed"
+    )
+
+
+def require_open_session(directory: Path) -> None:
+    if session_closing(directory):
+        raise ProtocolError(
+            "session is closing or closed; wait-for-close instead of publishing"
+        )
+
+
+def session_info(directory: Path) -> dict[str, Any]:
+    state = read_session_state(directory)
+    return {
+        "session_id": directory.name,
+        "session_directory": str(directory),
+        **{key: value for key, value in state.items() if key != "status"},
+        "session_status": state["status"],
+        "close_requested": marker_present(directory, CLOSE_REQUEST),
+        "review_pending": marker_present(directory, REVIEW_LOCK),
+        "dispatch_requested": marker_present(directory, DISPATCH_REQUEST),
+    }
 
 
 def load_message_input(
