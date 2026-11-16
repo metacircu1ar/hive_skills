@@ -1,0 +1,19 @@
+# Pain: the app is slow, heavy or unstable.
+# One regex per line; lines are joined with |. Matching ignores case.
+\bslow(?:ly|er|est)?\b
+\blag(?:s|gy|ging|ged)?\b
+\bfreez(?:e|es|ing)\b|\bfroze\b
+\bcrash(?:es|ed|ing)?\b
+\bbattery\b
+\boverheat(?:s|ing)?\b
+\bstuck\b
+\bunresponsive\b
+\bglitch(?:y|es|ing)?\b
+\bbuggy\b
+\bjank(?:y)?\b
+\bsluggish\b
+\btakes forever\b
+\bwon'?t (?:open|load)\b
+\bkeeps? (?:closing|crashing|loading)\b
+\bnot (?:loading|responsive)\b
+\bloading (?:screen|forever)\b

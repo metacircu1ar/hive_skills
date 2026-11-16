@@ -118,6 +118,19 @@ Each product-delivery skill includes its supporting references, templates, schem
 | [`security-review`](skills/audit/security-review/SKILL.md) | Run an umbrella security review composed from focused web skills. |
 | [`ios-prelaunch-checklist`](skills/audit/ios-prelaunch-checklist/SKILL.md) | Audit iOS App Store assets, technical setup, legal readiness, and signing. |
 
+### Growth skills
+
+[`skills/growth/`](skills/growth/) contains six skills for finding clients and marketing a product. They are generic: everything about a specific offer or product is a profile you write once and pass in. Nothing goes live, gets sent or changes spend without a person's approval. See the [growth README](skills/growth/README.md) for profiles and how the skills chain.
+
+| Skill | Purpose |
+| --- | --- |
+| [`review-lead-finder`](skills/growth/review-lead-finder/SKILL.md) | Find outreach leads by mining App Store reviews for a pain your offer solves; prove fit from a public page, find a public contact route and write the opening line. |
+| [`apple-ads-search-term-triage`](skills/growth/apple-ads-search-term-triage/SKILL.md) | Judge the intent of every search term in an Apple Ads export; write negatives, exact-match promotions and bid changes for approval. |
+| [`creative-gate`](skills/growth/creative-gate/SKILL.md) | Score ad images and videos against a rubric, baseline rules and the product's own rules; loop fixes; pass only what clears, for human approval. |
+| [`script-read-check`](skills/growth/script-read-check/SKILL.md) | Transcribe narrated media with local Whisper and report every misread, missing or extra word with timestamps. |
+| [`url-to-paused-ad`](skills/growth/url-to-paused-ad/SKILL.md) | Brand profile, research, concepts, images and the creative gate, then a package for manual upload or paused Meta ads. |
+| [`marketing-data-store`](skills/growth/marketing-data-store/SKILL.md) | Keep exports in one local SQLite file that agents read with read-only SQL; platform APIs stay write-only. |
+
 ## Use
 
 Clone the repository and copy the skill or reference you need into the directory expected by your agent runtime:
@@ -134,6 +147,7 @@ skills/hive-parallel-review-loop/
 skills/verified-commit-split/
 skills/product-delivery-skills/<skill-name>/
 skills/audit/<skill-name>/
+skills/growth/<skill-name>/
 ```
 
 ## Repository layout
@@ -151,5 +165,6 @@ skills/hive-parallel-review-loop/  Bounded multi-repository Hive workflow launch
 skills/verified-commit-split/    Content-preserving Git commit-splitting skill
 skills/audit/                    Focused audit skills
 skills/product-delivery-skills/  Self-contained product-delivery skills
+skills/growth/                   Profile-driven client-finding and marketing skills
 LICENSE                          MIT license
 ```
